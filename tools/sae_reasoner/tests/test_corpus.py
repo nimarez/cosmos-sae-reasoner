@@ -6,6 +6,7 @@ from tools.sae_reasoner.corpus import (
     BuildCorpusConfig,
     build_corpus_manifest,
     build_from_hf_files,
+    build_from_s3_prefix,
     parse_split_ratios,
 )
 
@@ -68,3 +69,42 @@ def test_build_corpus_manifest_from_jsonl(tmp_path: Path):
     assert output.exists()
     assert records[0]["id"] == "one"
     assert records[0]["metadata"]["source"] == "jsonl"
+
+
+def test_build_from_s3_prefix_reservoir_samples(monkeypatch):
+    class FakeS3Client:
+        def __init__(self):
+            self.calls = 0
+
+        def list_objects_v2(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "IsTruncated": True,
+                    "NextContinuationToken": "next",
+                    "Contents": [{"Key": f"clips/a_{idx}.mp4"} for idx in range(5)],
+                }
+            return {
+                "IsTruncated": False,
+                "Contents": [{"Key": f"clips/b_{idx}.mp4"} for idx in range(5)],
+            }
+
+    fake_client = FakeS3Client()
+    fake_boto3 = types.SimpleNamespace(client=lambda *_args, **_kwargs: fake_client)
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    records = build_from_s3_prefix(
+        BuildCorpusConfig(
+            output=Path("unused.jsonl"),
+            source="s3-prefix",
+            s3_uri="s3://bucket/clips/",
+            include_globs=("*.mp4",),
+            prompt="Describe {stem}.",
+            max_records=3,
+            split_ratios=(("sae_train", 1.0),),
+        )
+    )
+
+    assert len(records) == 3
+    assert all(record["media_path"].startswith("s3://bucket/clips/") for record in records)
+    assert fake_client.calls == 2

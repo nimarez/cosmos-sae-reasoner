@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
 from typing import Any, Iterator, Literal
 
 import torch
@@ -143,9 +142,14 @@ class CosmosReasonerRuntime:
         if self.init_mode == "meta":
             raise RuntimeLoadError("init_mode=meta can inspect architecture but cannot run inputs or forward passes")
         processor, _ = self.require_processor_and_model()
+        materialized_media_path = None
+        render_record = record
+        if record.media_type != "text":
+            materialized_media_path = materialize_media_path(record.media_path)
+            render_record = replace(record, media_path=materialized_media_path)
         text = render_record_prompt(
             processor,
-            record,
+            render_record,
             prompt_format=prompt_format,
             system_prompt=system_prompt,
         )
@@ -153,11 +157,11 @@ class CosmosReasonerRuntime:
         if record.media_type == "image":
             from PIL import Image
 
-            kwargs["images"] = [Image.open(materialize_media_path(record.media_path)).convert("RGB")]
+            kwargs["images"] = [Image.open(materialized_media_path).convert("RGB")]
         elif record.media_type == "video":
             # Qwen3VLProcessor-backed runtimes commonly accept videos here.
             # If a given install does not, the error is clearer at this boundary.
-            kwargs["videos"] = [materialize_media_path(record.media_path)]
+            kwargs["videos"] = [materialized_media_path]
         try:
             batch = processor(**kwargs)
         except Exception as exc:  # pragma: no cover - processor-specific
@@ -351,12 +355,12 @@ def _message_content(record: ManifestRecord) -> list[dict[str, Any]]:
         return [{"type": "text", "text": record.prompt}]
     if record.media_type == "image":
         return [
-            {"type": "image", "image": str(Path(record.media_path).resolve())},
+            {"type": "image", "image": str(record.media_path)},
             {"type": "text", "text": record.prompt},
         ]
     if record.media_type == "video":
         return [
-            {"type": "video", "video": str(Path(record.media_path).resolve())},
+            {"type": "video", "video": str(record.media_path)},
             {"type": "text", "text": record.prompt},
         ]
     raise ValueError(f"unsupported media_type={record.media_type!r}")

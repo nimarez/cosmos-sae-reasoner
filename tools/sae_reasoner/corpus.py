@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fnmatch
-import io
 import json
 import random
 from dataclasses import dataclass
@@ -221,24 +220,34 @@ def build_from_s3_prefix(config: BuildCorpusConfig) -> list[dict[str, Any]]:
     endpoint_url = __import__("os").environ.get("AWS_ENDPOINT_URL_S3") or __import__("os").environ.get("AWS_ENDPOINT_URL")
     kwargs = {"endpoint_url": endpoint_url} if endpoint_url else {}
     client = boto3.client("s3", **kwargs)
-    keys: list[str] = []
+    rng = random.Random(config.seed)
+    candidates: list[str] = []
+    seen = 0
     token = None
     while True:
         request: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
         if token:
             request["ContinuationToken"] = token
         response = client.list_objects_v2(**request)
-        keys.extend(obj["Key"] for obj in response.get("Contents", []))
+        for obj in response.get("Contents", []):
+            key = obj["Key"]
+            if not match_any(key, config.include_globs) or infer_media_type(key, config.media_type) == "text":
+                continue
+            seen += 1
+            if len(candidates) < config.max_records:
+                candidates.append(key)
+            else:
+                replacement = rng.randrange(seen)
+                if replacement < config.max_records:
+                    candidates[replacement] = key
         if not response.get("IsTruncated"):
             break
         token = response.get("NextContinuationToken")
-    candidates = [key for key in keys if match_any(key, config.include_globs) and infer_media_type(key, config.media_type) != "text"]
-    rng = random.Random(config.seed)
     rng.shuffle(candidates)
     prompt = required(config.prompt, "--prompt")
     records: list[dict[str, Any]] = []
-    for idx, key in enumerate(candidates[: config.max_records]):
-        split = split_for_index(idx, config.max_records, config.split_ratios)
+    for idx, key in enumerate(candidates):
+        split = split_for_index(idx, len(candidates), config.split_ratios)
         records.append(
             make_manifest_dict(
                 record_id=f"s3:{bucket}:{key}",
@@ -283,8 +292,8 @@ def iter_jsonl_uri(uri: str) -> Iterable[dict[str, Any]]:
             raise RuntimeError("S3 JSONL input requires boto3.") from exc
         endpoint_url = __import__("os").environ.get("AWS_ENDPOINT_URL_S3") or __import__("os").environ.get("AWS_ENDPOINT_URL")
         kwargs = {"endpoint_url": endpoint_url} if endpoint_url else {}
-        body = boto3.client("s3", **kwargs).get_object(Bucket=bucket, Key=key)["Body"].read()
-        stream = io.StringIO(body.decode("utf-8"))
+        body = boto3.client("s3", **kwargs).get_object(Bucket=bucket, Key=key)["Body"]
+        stream = (line.decode("utf-8") for line in body.iter_lines())
     else:
         raise ValueError(f"unsupported JSONL URI scheme for {uri!r}")
     for line_no, line in enumerate(stream, start=1):

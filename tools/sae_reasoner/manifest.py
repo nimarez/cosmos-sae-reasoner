@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 from urllib.parse import urlparse
 
-from .artifacts import read_jsonl, repo_root, write_jsonl
+from .artifacts import iter_jsonl, repo_root, write_jsonl
 
 MediaType = Literal["text", "image", "video"]
 
@@ -71,8 +71,13 @@ class ManifestRecord:
 
 
 def load_manifest(path: Path) -> list[ManifestRecord]:
+    return list(iter_manifest(path))
+
+
+def iter_manifest(path: Path) -> Iterator[ManifestRecord]:
     base = repo_root()
-    return [ManifestRecord.from_json(obj, base_dir=base) for obj in read_jsonl(path)]
+    for obj in iter_jsonl(path):
+        yield ManifestRecord.from_json(obj, base_dir=base)
 
 
 def make_sample_manifest(output: Path) -> list[ManifestRecord]:

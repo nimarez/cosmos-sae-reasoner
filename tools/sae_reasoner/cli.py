@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import quote
 
 from .artifacts import ensure_dir, write_jsonl
-from .manifest import load_manifest, make_sample_manifest
+from .manifest import iter_manifest, load_manifest, make_sample_manifest
 
 
 class RuntimeLoadError(RuntimeError):
@@ -244,9 +244,6 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
     from .runtime import CosmosReasonerRuntime
     from .storage import make_activation_store
 
-    records = load_manifest(args.manifest)
-    if args.max_examples is not None:
-        records = records[: args.max_examples]
     store = make_activation_store(args.output_dir)
     runtime = CosmosReasonerRuntime(
         args.model_id,
@@ -255,7 +252,9 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
         init_mode=args.init_mode,
     ).load()
     metadata: list[dict[str, Any]] = []
-    for idx, record in enumerate(records):
+    for idx, record in enumerate(iter_manifest(args.manifest)):
+        if args.max_examples is not None and idx >= args.max_examples:
+            break
         hidden, meta = runtime.collect_prefill(
             record,
             layer=args.layer,

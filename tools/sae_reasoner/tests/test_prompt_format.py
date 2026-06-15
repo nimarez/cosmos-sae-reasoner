@@ -36,3 +36,17 @@ def test_render_chat_prompt_includes_system_prompt():
     assert "system" in rendered
     assert "You are terse." in rendered
     assert "Describe contact." in rendered
+
+
+def test_render_chat_prompt_preserves_remote_media_uri():
+    record = ManifestRecord(
+        id="x",
+        media_type="image",
+        media_path="hf://dataset/org/repo/image.jpg",
+        prompt="Describe the image.",
+    )
+
+    rendered = render_record_prompt(FakeProcessor(), record, prompt_format="chat")
+
+    assert "hf://dataset/org/repo/image.jpg" in rendered
+    assert "hf:/dataset" not in rendered
