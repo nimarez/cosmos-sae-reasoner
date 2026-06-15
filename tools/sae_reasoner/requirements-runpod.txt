@@ -1,0 +1,17 @@
+# Install with uv:
+#   uv pip install --torch-backend=auto -r tools/sae_reasoner/requirements-runpod.txt
+torch
+torchvision
+accelerate
+boto3
+datasets
+huggingface_hub
+pillow
+pytest
+safetensors
+transformers>=4.57.0
+
+# Helpful for Qwen/Cosmos-style video processing if the active processor uses it.
+imageio
+opencv-python-headless
+qwen-vl-utils

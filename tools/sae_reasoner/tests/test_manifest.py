@@ -1,0 +1,47 @@
+from pathlib import Path
+
+from tools.sae_reasoner.manifest import ManifestRecord, load_manifest, make_sample_manifest
+
+
+def test_make_sample_manifest(tmp_path: Path):
+    out = tmp_path / "sample.jsonl"
+    records = make_sample_manifest(out)
+    assert out.exists()
+    assert len(records) >= 3
+    loaded = load_manifest(out)
+    assert [r.id for r in loaded] == [r.id for r in records]
+    assert all(set(record.to_json()) <= {"id", "media_type", "prompt", "media_path", "tags"} for record in loaded)
+
+
+def test_manifest_resolves_relative_media_path(tmp_path: Path, monkeypatch):
+    media = tmp_path / "image.png"
+    media.write_bytes(b"not actually decoded in this test")
+    record = ManifestRecord.from_json(
+        {
+            "id": "relative-image",
+            "media_type": "image",
+            "media_path": "image.png",
+            "prompt": "describe this",
+        },
+        base_dir=tmp_path,
+    )
+    monkeypatch.chdir("/")
+    assert record.media_path == str(media.resolve())
+    assert Path(record.media_path).exists()
+
+
+def test_manifest_accepts_remote_media_path():
+    record = ManifestRecord.from_json(
+        {
+            "id": "remote-video",
+            "media_type": "video",
+            "media_path": "hf://dataset/nvidia/example/videos/clip.mp4",
+            "prompt": "describe this",
+            "tags": ["video"],
+            "metadata": {"source": "hf-files"},
+        }
+    )
+
+    assert record.media_path == "hf://dataset/nvidia/example/videos/clip.mp4"
+    assert record.metadata == {"source": "hf-files"}
+    assert record.to_json()["metadata"] == {"source": "hf-files"}
