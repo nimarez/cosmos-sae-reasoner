@@ -14,7 +14,7 @@ def test_shard_name_escapes_dataset_style_ids():
     assert shard_name_for_record(2, "split/example_001") == "000002_split%2Fexample_001.pt"
 
 
-def test_prompt_format_defaults_by_command():
+def test_prompt_format_is_chat_only_by_command():
     parser = build_parser()
     collect_args = parser.parse_args(
         [
@@ -42,8 +42,9 @@ def test_prompt_format_defaults_by_command():
             "hello",
         ]
     )
-    assert collect_args.prompt_format == "raw"
+    assert collect_args.prompt_format == "chat"
     assert steer_args.prompt_format == "chat"
+    assert "--prompt-format" not in parser.format_help()
 
 
 def test_build_corpus_manifest_parser_defaults():

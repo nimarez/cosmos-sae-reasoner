@@ -108,7 +108,6 @@ python -m tools.sae_reasoner collect-activations \
   --model-id nvidia/Cosmos3-Nano \
   --manifest outputs/sae_reasoner/sample_manifest.jsonl \
   --layer 18 \
-  --prompt-format chat \
   --output-dir outputs/sae_reasoner/activations/sample_l18 \
   --max-examples 8
 
@@ -119,7 +118,6 @@ python -m tools.sae_reasoner collect-activations \
   --model-id nvidia/Cosmos3-Nano \
   --manifest outputs/sae_reasoner/sample_manifest.jsonl \
   --layer 18 \
-  --prompt-format chat \
   --output-dir s3://my-bucket/cosmos/sae_reasoner/activations/sample_l18 \
   --max-examples 8
 
@@ -146,7 +144,6 @@ python -m tools.sae_reasoner steer \
   --feature-id 0 \
   --multiplier 5 \
   --scope decode \
-  --prompt-format chat \
   --prompt "What is the robot likely to do next?"
 ```
 

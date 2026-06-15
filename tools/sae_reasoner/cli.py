@@ -69,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("collect-activations", help="collect prefill activations")
     add_model_args(p)
-    add_prompt_args(p, default_prompt_format="raw")
+    add_prompt_args(p)
     p.add_argument("--manifest", type=Path, required=True)
     p.add_argument("--layer", type=int, required=True)
     p.add_argument(
@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("steer", help="baseline vs steered generation")
     add_model_args(p)
-    add_prompt_args(p, default_prompt_format="chat")
+    add_prompt_args(p)
     p.add_argument("--sae", type=Path, required=True)
     p.add_argument("--layer", type=int, required=True)
     p.add_argument("--feature-id", type=int, required=True)
@@ -137,20 +137,12 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_prompt_args(parser: argparse.ArgumentParser, *, default_prompt_format: str) -> None:
-    parser.add_argument(
-        "--prompt-format",
-        default=default_prompt_format,
-        choices=["chat", "raw"],
-        help=(
-            "chat uses the model processor chat template; raw passes prompt text directly "
-            f"(default: {default_prompt_format})"
-        ),
-    )
+def add_prompt_args(parser: argparse.ArgumentParser) -> None:
+    parser.set_defaults(prompt_format="chat")
     parser.add_argument(
         "--system-prompt",
         default=None,
-        help="Optional system prompt. In raw mode it is prepended as plain text.",
+        help="Optional system prompt passed through the model processor chat template.",
     )
 
 

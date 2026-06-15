@@ -9,7 +9,7 @@ import torch
 from ..manifest import ManifestRecord
 from ..media import materialize_media_path
 
-PromptFormat = Literal["chat", "raw"]
+PromptFormat = Literal["chat"]
 
 
 class RuntimeLoadError(RuntimeError):
@@ -315,14 +315,8 @@ def render_record_prompt(
     prompt_format: PromptFormat = "chat",
     system_prompt: str | None = None,
 ) -> str:
-    if prompt_format == "raw":
-        if record.media_type != "text":
-            raise RuntimeLoadError(
-                "prompt-format=raw supports text-only records; use --prompt-format chat for image/video records"
-            )
-        return _raw_prompt_text(record.prompt, system_prompt)
     if prompt_format != "chat":
-        raise ValueError("prompt_format must be one of: chat, raw")
+        raise ValueError("prompt_format must be chat")
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
@@ -337,21 +331,13 @@ def render_text_prompt(
     prompt_format: PromptFormat = "chat",
     system_prompt: str | None = None,
 ) -> str:
-    if prompt_format == "raw":
-        return _raw_prompt_text(prompt, system_prompt)
     if prompt_format != "chat":
-        raise ValueError("prompt_format must be one of: chat, raw")
+        raise ValueError("prompt_format must be chat")
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
     messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
     return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-
-def _raw_prompt_text(prompt: str, system_prompt: str | None) -> str:
-    if not system_prompt:
-        return prompt
-    return f"{system_prompt.rstrip()}\n\n{prompt.lstrip()}"
 
 
 def _message_content(record: ManifestRecord) -> list[dict[str, Any]]:
