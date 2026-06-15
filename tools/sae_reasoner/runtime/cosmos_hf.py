@@ -316,6 +316,10 @@ def render_record_prompt(
     system_prompt: str | None = None,
 ) -> str:
     if prompt_format == "raw":
+        if record.media_type != "text":
+            raise RuntimeLoadError(
+                "prompt-format=raw supports text-only records; use --prompt-format chat for image/video records"
+            )
         return _raw_prompt_text(record.prompt, system_prompt)
     if prompt_format != "chat":
         raise ValueError("prompt_format must be one of: chat, raw")

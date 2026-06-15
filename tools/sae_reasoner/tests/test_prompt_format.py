@@ -1,5 +1,7 @@
 from tools.sae_reasoner.manifest import ManifestRecord
-from tools.sae_reasoner.runtime.cosmos_hf import render_record_prompt, render_text_prompt
+import pytest
+
+from tools.sae_reasoner.runtime.cosmos_hf import RuntimeLoadError, render_record_prompt, render_text_prompt
 
 
 class FakeProcessor:
@@ -24,6 +26,18 @@ def test_render_raw_prompt_with_system_prompt():
         )
         == "You are terse.\n\nDescribe contact."
     )
+
+
+def test_render_raw_prompt_rejects_multimodal_records():
+    record = ManifestRecord(
+        id="x",
+        media_type="image",
+        media_path="image.jpg",
+        prompt="Describe the image.",
+    )
+
+    with pytest.raises(RuntimeLoadError, match="text-only"):
+        render_record_prompt(FakeProcessor(), record, prompt_format="raw")
 
 
 def test_render_chat_prompt_includes_system_prompt():
