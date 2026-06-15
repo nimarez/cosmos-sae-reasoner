@@ -191,6 +191,11 @@ class CosmosReasonerRuntime:
             prompt_format=prompt_format,
             system_prompt=system_prompt,
         )
+        token_map, token_meta = build_token_map(
+            processor=getattr(self, "processor", None),
+            batch=inputs,
+            media_type=record.media_type,
+        )
         with self._hook(layer, capture):
             outputs = model(**inputs, use_cache=False)
         if not captures:
@@ -209,6 +214,10 @@ class CosmosReasonerRuntime:
             "num_tokens": int(hidden.shape[0]),
             "hidden_dim": int(hidden.shape[-1]),
             "model_output_type": type(outputs).__name__,
+            "input_summary": summarize_batch(inputs),
+            "token_kind_counts": count_token_kinds(token_map),
+            "visual_grid": token_meta.get("visual_grid"),
+            "token_map": token_map,
         }
         return hidden, meta
 
@@ -338,6 +347,167 @@ def render_text_prompt(
         messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
     messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
     return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def build_token_map(
+    *,
+    processor: Any | None,
+    batch: dict[str, Any],
+    media_type: str,
+    context_radius: int = 8,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    input_ids = _first_row(batch.get("input_ids"))
+    mm_token_type_ids = _first_row(batch.get("mm_token_type_ids"))
+    tokenizer = getattr(processor, "tokenizer", None)
+    visual_grid = _visual_grid_metadata(processor, batch, media_type, mm_token_type_ids)
+    visual_ordinal = 0
+    tokens: list[dict[str, Any]] = []
+    for idx, token_id in enumerate(input_ids):
+        token_text = _decode_token(tokenizer, token_id)
+        is_visual = idx < len(mm_token_type_ids) and int(mm_token_type_ids[idx]) != 0
+        kind = media_type if is_visual and media_type in {"image", "video"} else _token_kind(tokenizer, token_id, token_text)
+        entry: dict[str, Any] = {
+            "index": idx,
+            "kind": kind,
+            "token_id": int(token_id),
+            "token_text": token_text,
+        }
+        if kind == "text":
+            entry["text_context"] = _decode_window(tokenizer, input_ids, idx, context_radius)
+        if is_visual:
+            entry["visual_ordinal"] = visual_ordinal
+            visual_position = _visual_position(visual_grid, visual_ordinal)
+            if visual_position:
+                entry["visual_position"] = visual_position
+            visual_ordinal += 1
+        tokens.append(entry)
+    return tokens, {"visual_grid": visual_grid}
+
+
+def summarize_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    summary = {}
+    for key, value in batch.items():
+        if hasattr(value, "shape"):
+            summary[key] = {
+                "shape": [int(dim) for dim in value.shape],
+                "dtype": str(getattr(value, "dtype", "")),
+            }
+        else:
+            summary[key] = {"type": type(value).__name__}
+    return summary
+
+
+def count_token_kinds(token_map: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for token in token_map:
+        kind = str(token.get("kind", "unknown"))
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def _first_row(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if value and isinstance(value[0], list):
+        value = value[0]
+    return [int(item) for item in value]
+
+
+def _decode_token(tokenizer: Any | None, token_id: int) -> str:
+    if tokenizer is None:
+        return str(token_id)
+    try:
+        return tokenizer.decode([int(token_id)], skip_special_tokens=False)
+    except TypeError:
+        return tokenizer.decode([int(token_id)])
+
+
+def _decode_window(tokenizer: Any | None, input_ids: list[int], token_index: int, radius: int) -> str:
+    if tokenizer is None:
+        return ""
+    start = max(0, token_index - radius)
+    end = min(len(input_ids), token_index + radius + 1)
+    try:
+        return tokenizer.decode(input_ids[start:end], skip_special_tokens=False)
+    except TypeError:
+        return tokenizer.decode(input_ids[start:end])
+
+
+def _token_kind(tokenizer: Any | None, token_id: int, token_text: str) -> str:
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    if int(token_id) in special_ids or (token_text.startswith("<|") and token_text.endswith("|>")):
+        return "special"
+    return "text"
+
+
+def _visual_grid_metadata(
+    processor: Any | None,
+    batch: dict[str, Any],
+    media_type: str,
+    mm_token_type_ids: list[int],
+) -> dict[str, Any] | None:
+    grid_key = "video_grid_thw" if media_type == "video" else "image_grid_thw"
+    grid_rows = _grid_rows(batch.get(grid_key))
+    if not grid_rows:
+        return None
+    t, h, w = grid_rows[0]
+    visual_tokens = sum(1 for value in mm_token_type_ids if int(value) != 0)
+    merge_size = _merge_size(processor, t, h, w, visual_tokens)
+    merged_h = max(1, h // merge_size)
+    merged_w = max(1, w // merge_size)
+    return {
+        "media_type": media_type,
+        "grid_key": grid_key,
+        "grid_thw": [t, h, w],
+        "merge_size": merge_size,
+        "merged_grid_thw": [t, merged_h, merged_w],
+        "visual_tokens": visual_tokens,
+    }
+
+
+def _grid_rows(value: Any) -> list[list[int]]:
+    if value is None:
+        return []
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    return [[int(item) for item in row] for row in value]
+
+
+def _merge_size(processor: Any | None, t: int, h: int, w: int, visual_tokens: int) -> int:
+    image_processor = getattr(processor, "image_processor", None)
+    configured = getattr(image_processor, "merge_size", None)
+    if isinstance(configured, int) and configured > 0:
+        return configured
+    if visual_tokens <= 0:
+        return 1
+    full_units = max(1, t * h * w)
+    ratio = max(1, round((full_units / visual_tokens) ** 0.5))
+    return ratio if h % ratio == 0 and w % ratio == 0 else 1
+
+
+def _visual_position(visual_grid: dict[str, Any] | None, visual_ordinal: int) -> dict[str, Any] | None:
+    if not visual_grid:
+        return None
+    _t, merged_h, merged_w = visual_grid["merged_grid_thw"]
+    merge_size = int(visual_grid["merge_size"])
+    tokens_per_frame = max(1, int(merged_h) * int(merged_w))
+    frame = visual_ordinal // tokens_per_frame
+    offset = visual_ordinal % tokens_per_frame
+    patch_y = offset // int(merged_w)
+    patch_x = offset % int(merged_w)
+    return {
+        "frame": int(frame),
+        "patch_y": int(patch_y),
+        "patch_x": int(patch_x),
+        "patch_y_range": [int(patch_y * merge_size), int((patch_y + 1) * merge_size)],
+        "patch_x_range": [int(patch_x * merge_size), int((patch_x + 1) * merge_size)],
+    }
 
 
 def _message_content(record: ManifestRecord) -> list[dict[str, Any]]:

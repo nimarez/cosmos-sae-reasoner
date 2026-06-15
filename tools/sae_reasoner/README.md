@@ -164,11 +164,24 @@ Remote `media_path` values can use `hf://dataset/<namespace>/<repo>/<path>`,
 `s3://bucket/key`, or HTTPS URLs. S3 credentials are read from the standard AWS
 environment variables.
 
+## Token Maps
+
+Activation shards include a `token_map` in their saved metadata. Each token
+entry stores the token index, token id, decoded token text, and a token kind:
+`text`, `special`, `image`, or `video`. For image/video tokens, the collector
+also saves processor grid metadata such as `image_grid_thw`/`video_grid_thw`
+and approximate frame/patch coordinates when the active processor exposes them.
+
+`metadata.jsonl` stays compact and stores only record-level metadata plus token
+kind counts and grid summaries. `find-features` reads the full shard token map
+and attaches the relevant token entry to each top activating feature example.
+
 ## Visualization
 
 `render-feature-report` creates a standalone HTML browser for the
 `find-features` JSONL output. The layout is intentionally close to the
 Anthropic feature-browser workflow: feature list on the left, top activating
 examples on the right, activation bars, token positions, prompts, tags, and
-source media paths. It is static HTML, so it can be uploaded as a RunPod
-artifact or opened locally.
+source media paths. When token maps are available, the report also shows token
+kind, decoded text context, or approximate visual frame/patch coordinates. It
+is static HTML, so it can be uploaded as a RunPod artifact or opened locally.

@@ -233,7 +233,8 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
       if (!q) return true;
       if (String(feature.feature_id).toLowerCase().includes(q)) return true;
       return feature.examples.some((row) => [
-        row.prompt, row.record_id, row.media_type, row.media_path, row.tags
+        row.prompt, row.record_id, row.media_type, row.media_path, row.tags,
+        row.token_info?.kind, row.token_info?.token_text, row.token_info?.text_context
       ].map(textOf).join(" ").toLowerCase().includes(q));
     }}
 
@@ -284,6 +285,13 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
       const width = Math.max(2, Math.min(100, 100 * activation / max));
       const tags = Array.isArray(row.tags) ? row.tags : [];
       const mediaPath = row.media_path || row.metadata?.source_uri || "";
+      const token = row.token_info || {{}};
+      const pos = token.visual_position || {{}};
+      const tokenDetail = token.kind === "text"
+        ? `${{esc(token.token_text || "")}}${{token.text_context ? `<div class="path">${{esc(token.text_context)}}</div>` : ""}}`
+        : token.visual_position
+          ? `frame ${{esc(pos.frame)}} - patch (${{esc(pos.patch_x)}}, ${{esc(pos.patch_y)}})`
+          : esc(token.token_text || "");
       return `
         <article class="example">
           <div class="example-head">
@@ -297,9 +305,11 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
           <div class="meta">
             <span class="pill">${{esc(row.media_type || "unknown")}}</span>
             <span class="pill">token ${{esc(row.token_index)}}</span>
+            ${{token.kind ? `<span class="pill">${{esc(token.kind)}}</span>` : ""}}
             <span class="pill">${{esc(row.shard || "")}}</span>
             ${{tags.map((tag) => `<span class="pill">${{esc(tag)}}</span>`).join("")}}
           </div>
+          ${{token.kind ? `<div class="path">${{tokenDetail}}</div>` : ""}}
           ${{mediaPath ? `<div class="path">${{esc(mediaPath)}}</div>` : ""}}
         </article>
       `;

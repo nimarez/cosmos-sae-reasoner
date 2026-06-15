@@ -257,7 +257,7 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
         shard_uri = store.write_torch(shard_name, {"activations": hidden, "meta": meta})
         meta["shard"] = shard_name
         meta["shard_uri"] = shard_uri
-        metadata.append(meta)
+        metadata.append(compact_activation_meta(meta))
         print(json.dumps({"collected": record.id, "tokens": meta["num_tokens"], "shard": shard_name, "uri": shard_uri}))
     metadata_text = "".join(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n" for record in metadata)
     store.write_text("metadata.jsonl", metadata_text)
@@ -307,6 +307,7 @@ def cmd_find_features(args: argparse.Namespace) -> int:
         payload = torch.load(shard_path, map_location="cpu")
         acts = payload["activations"].float()
         meta = payload.get("meta", {})
+        token_map = meta.get("token_map") or []
         with torch.no_grad():
             features = sae.encode(acts)
         for feature_id in feature_ids:
@@ -320,6 +321,7 @@ def cmd_find_features(args: argparse.Namespace) -> int:
                         "feature_id": feature_id,
                         "activation": float(value),
                         "token_index": int(token_idx),
+                        "token_info": token_info_for_index(token_map, token_idx),
                         "record_id": meta.get("id"),
                         "prompt": meta.get("prompt"),
                         "media_type": meta.get("media_type"),
@@ -333,6 +335,16 @@ def cmd_find_features(args: argparse.Namespace) -> int:
     write_jsonl(args.output, records[: max(args.top_n, len(feature_ids) * args.top_n)])
     print(json.dumps({"output": str(args.output), "num_records": len(records)}, indent=2))
     return 0
+
+
+def compact_activation_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in meta.items() if key != "token_map"}
+
+
+def token_info_for_index(token_map: list[dict[str, Any]], token_index: int) -> dict[str, Any] | None:
+    if 0 <= token_index < len(token_map):
+        return token_map[token_index]
+    return None
 
 
 def cmd_render_feature_report(args: argparse.Namespace) -> int:

@@ -9,7 +9,9 @@ def test_render_feature_report(tmp_path: Path):
         (
             '{"feature_id":3,"activation":2.5,"record_id":"rec","token_index":4,'
             '"prompt":"Describe the scene","media_type":"video","media_path":"s3://bucket/clip.mp4",'
-            '"tags":["video","sae_train"],"shard":"000000_rec.pt"}\n'
+            '"tags":["video","sae_train"],"shard":"000000_rec.pt",'
+            '"token_info":{"kind":"video","token_text":"<|video_pad|>",'
+            '"visual_position":{"frame":2,"patch_x":3,"patch_y":4}}}\n'
         ),
         encoding="utf-8",
     )
@@ -21,3 +23,5 @@ def test_render_feature_report(tmp_path: Path):
     assert "Test Features" in html
     assert "Feature" in html
     assert "Describe the scene" in html
+    assert "patch" in html
+    assert "video" in html
