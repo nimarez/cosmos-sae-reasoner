@@ -80,8 +80,8 @@ class CosmosReasonerRuntime:
                 else:
                     with _default_dtype(self.dtype):
                         self.model = model_cls.from_config(config, trust_remote_code=self.trust_remote_code)
-                    self.model.to(dtype=self.dtype)
-            if self.init_mode != "meta" and self.device != "cuda":
+                    self.model.to(device=self.device, dtype=self.dtype)
+            if self.init_mode not in {"meta", "random"} and self.device != "cuda":
                 self.model.to(self.device)
             if self.init_mode != "meta":
                 self.model.eval()
