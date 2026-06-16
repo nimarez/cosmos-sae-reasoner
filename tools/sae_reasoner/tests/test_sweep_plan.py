@@ -1,6 +1,7 @@
 import argparse
 
 from tools.sae_reasoner.scripts.plan_training_sweep import build_configs, render_script
+from tools.sae_reasoner.scripts.wait_for_collection_then_sweep import is_complete, log_has_collect_complete
 
 
 def args(**overrides):
@@ -51,3 +52,16 @@ def test_rendered_script_runs_analysis_after_each_train():
     assert "analyze-sae" in script
     assert ".venv/bin/python -m tools.sae_reasoner train-sae" in script
     assert script.index("train-sae") < script.index("analyze-sae")
+
+
+def test_wait_for_collection_requires_counts_and_completion_log(tmp_path):
+    log = tmp_path / "collect.log"
+    log.write_text('{"event":"collect_metric"}\n', encoding="utf-8")
+
+    assert not is_complete({"pt": 10, "sidecars": 10}, 10, log)
+
+    log.write_text('{"event":"collect_complete"}\n', encoding="utf-8")
+
+    assert is_complete({"pt": 10, "sidecars": 10}, 10, log)
+    assert not is_complete({"pt": 10, "sidecars": 9}, 10, log)
+    assert log_has_collect_complete(log)
