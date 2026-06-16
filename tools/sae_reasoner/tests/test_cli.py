@@ -19,12 +19,17 @@ from tools.sae_reasoner.cli import (
 def test_shard_path_escapes_dataset_style_ids(tmp_path: Path):
     shard = shard_path_for_record(tmp_path, 7, "../split/example_001")
     assert shard.parent == tmp_path
-    assert shard.name == "000007_..%2Fsplit%2Fexample_001.pt"
+    assert shard.name.startswith("000007_example_001_")
+    assert shard.name.endswith(".pt")
     assert "/" not in shard.name
 
 
 def test_shard_name_escapes_dataset_style_ids():
-    assert shard_name_for_record(2, "split/example_001") == "000002_split%2Fexample_001.pt"
+    name = shard_name_for_record(2, "hf:nvidia/repo/path/to/episode_034240_clip000.mp4")
+
+    assert name.startswith("000002_episode_034240_clip000_")
+    assert name.endswith(".pt")
+    assert "%2F" not in name
 
 
 def test_prompt_format_is_chat_only_by_command():

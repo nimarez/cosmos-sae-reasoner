@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from .artifacts import ensure_dir, write_jsonl
 from .manifest import iter_manifest, load_manifest, make_sample_manifest
@@ -1022,8 +1022,12 @@ def shard_path_for_record(output_dir: Path, idx: int, record_id: str) -> Path:
 
 
 def shard_name_for_record(idx: int, record_id: str) -> str:
-    safe_id = quote(record_id, safe="")
-    return f"{idx:06d}_{safe_id}.pt"
+    leaf = record_id.rstrip("/").rsplit("/", 1)[-1] or record_id
+    stem = Path(leaf).stem or leaf
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in stem).strip("._")
+    safe_stem = (safe_stem or "record")[:80]
+    digest = hashlib.sha1(record_id.encode("utf-8")).hexdigest()[:10]
+    return f"{idx:06d}_{safe_stem}_{digest}.pt"
 
 
 def parse_feature_ids(raw: str, feature_dim: int) -> list[int]:
