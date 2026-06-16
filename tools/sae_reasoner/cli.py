@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -105,6 +106,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/reports/features.html"))
     p.add_argument("--title", default="Cosmos SAE Feature Browser")
     p.set_defaults(func=cmd_render_feature_report)
+
+    p = sub.add_parser("find-neighbors", help="find nearest activation-token neighbors by cosine similarity")
+    p.add_argument("--activation-dir", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--max-tokens", type=int, default=5000)
+    p.add_argument("--num-queries", type=int, default=40)
+    p.add_argument("--neighbors", type=int, default=8)
+    p.add_argument("--query-kinds", default="", help="Comma-separated token kinds, e.g. image,video,text. Empty means all.")
+    p.add_argument("--seed", type=int, default=0)
+    p.set_defaults(func=cmd_find_neighbors)
+
+    p = sub.add_parser("render-neighbor-report", help="render nearest-token activation neighbors as standalone HTML")
+    p.add_argument("--neighbors", type=Path, required=True)
+    p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/reports/neighbors.html"))
+    p.add_argument("--title", default="Cosmos Activation Nearest Neighbors")
+    p.set_defaults(func=cmd_render_neighbor_report)
 
     p = sub.add_parser("steer", help="baseline vs steered generation")
     add_model_args(p)
@@ -347,10 +364,105 @@ def token_info_for_index(token_map: list[dict[str, Any]], token_index: int) -> d
     return None
 
 
+def load_activation_examples(path: Path, *, max_tokens: int, seed: int) -> tuple[list[dict[str, Any]], torch.Tensor]:
+    import torch
+
+    if max_tokens <= 1:
+        raise ValueError("--max-tokens must be greater than 1")
+    rng = random.Random(seed)
+    examples: list[dict[str, Any]] = []
+    vectors: list[torch.Tensor] = []
+    seen = 0
+    for shard_path in sorted(path.glob("*.pt")):
+        payload = torch.load(shard_path, map_location="cpu")
+        if "activations" not in payload:
+            continue
+        activations = payload["activations"].float()
+        acts = activations.reshape(-1, activations.shape[-1])
+        meta = payload.get("meta", {})
+        token_map = meta.get("token_map") or []
+        for token_index in range(acts.shape[0]):
+            seen += 1
+            replacement = len(examples) if len(examples) < max_tokens else rng.randrange(seen)
+            if replacement >= max_tokens:
+                continue
+            example = activation_example(meta, shard_path.name, token_map, token_index)
+            vector = acts[token_index].detach().clone()
+            if replacement == len(examples):
+                examples.append(example)
+                vectors.append(vector)
+            else:
+                examples[replacement] = example
+                vectors[replacement] = vector
+    if not vectors:
+        raise ValueError(f"no activation shards found in {path}")
+    return examples, torch.stack(vectors, dim=0)
+
+
+def activation_example(meta: dict[str, Any], shard: str, token_map: list[dict[str, Any]], token_index: int) -> dict[str, Any]:
+    return {
+        "record_id": meta.get("id"),
+        "prompt": meta.get("prompt"),
+        "media_type": meta.get("media_type"),
+        "media_path": meta.get("media_path"),
+        "tags": meta.get("tags", []),
+        "metadata": meta.get("metadata", {}),
+        "shard": shard,
+        "token_index": int(token_index),
+        "token_info": token_info_for_index(token_map, token_index),
+    }
+
+
+def parse_kind_filter(value: str) -> set[str]:
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
 def cmd_render_feature_report(args: argparse.Namespace) -> int:
     from .visualize import render_feature_report
 
     render_feature_report(args.features, args.output, title=args.title)
+    print(json.dumps({"output": str(args.output)}, indent=2))
+    return 0
+
+
+def cmd_find_neighbors(args: argparse.Namespace) -> int:
+    import torch
+
+    examples, matrix = load_activation_examples(args.activation_dir, max_tokens=args.max_tokens, seed=args.seed)
+    if len(examples) < 2:
+        raise ValueError(f"need at least 2 activation tokens, found {len(examples)}")
+    allowed_kinds = parse_kind_filter(args.query_kinds)
+    query_candidates = [
+        idx for idx, example in enumerate(examples) if not allowed_kinds or (example.get("token_info") or {}).get("kind") in allowed_kinds
+    ]
+    if not query_candidates:
+        raise ValueError(f"no query tokens matched kinds={sorted(allowed_kinds)}")
+    rng = random.Random(args.seed)
+    rng.shuffle(query_candidates)
+    query_indices = query_candidates[: min(args.num_queries, len(query_candidates))]
+    normalized = torch.nn.functional.normalize(matrix.float(), dim=1)
+    records: list[dict[str, Any]] = []
+    for query_index in query_indices:
+        sims = normalized @ normalized[query_index]
+        top_values, top_indices = torch.topk(sims, k=min(args.neighbors + 1, sims.numel()))
+        neighbors = []
+        for value, neighbor_index in zip(top_values.tolist(), top_indices.tolist()):
+            neighbor_index = int(neighbor_index)
+            if neighbor_index == query_index:
+                continue
+            neighbors.append({**examples[neighbor_index], "similarity": float(value)})
+            if len(neighbors) >= args.neighbors:
+                break
+        records.append({"query": examples[query_index], "neighbors": neighbors})
+    write_jsonl(args.output, records)
+    print(json.dumps({"output": str(args.output), "num_queries": len(records), "sampled_tokens": len(examples)}, indent=2))
+    return 0
+
+
+def cmd_render_neighbor_report(args: argparse.Namespace) -> int:
+    from .visualize import render_neighbor_report
+
+    render_neighbor_report(args.neighbors, args.output, title=args.title)
     print(json.dumps({"output": str(args.output)}, indent=2))
     return 0
 

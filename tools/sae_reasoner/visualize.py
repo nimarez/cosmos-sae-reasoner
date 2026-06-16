@@ -23,6 +23,12 @@ def render_feature_report(features_path: Path, output: Path, *, title: str = "Co
     output.write_text(render_html(features, title=title), encoding="utf-8")
 
 
+def render_neighbor_report(neighbors_path: Path, output: Path, *, title: str = "Cosmos Activation Nearest Neighbors") -> None:
+    rows = read_jsonl(neighbors_path)
+    ensure_dir(output.parent)
+    output.write_text(render_neighbor_html(rows, title=title), encoding="utf-8")
+
+
 def render_html(features: list[dict[str, Any]], *, title: str) -> str:
     data = json.dumps(features, ensure_ascii=True)
     escaped_title = html.escape(title)
@@ -323,6 +329,172 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
       state.query = searchEl.value;
       render();
     }});
+    render();
+  </script>
+</body>
+</html>
+"""
+
+
+def render_neighbor_html(rows: list[dict[str, Any]], *, title: str) -> str:
+    data = json.dumps(rows, ensure_ascii=True)
+    escaped_title = html.escape(title)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escaped_title}</title>
+  <style>
+    :root {{
+      --bg: #f6f7f7;
+      --panel: #ffffff;
+      --ink: #161819;
+      --muted: #657074;
+      --line: #d7dddf;
+      --accent: #15616d;
+      --accent-soft: #dceff1;
+      --warn: #8c5a14;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }}
+    header {{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      border-bottom: 1px solid var(--line);
+      background: rgba(246, 247, 247, 0.94);
+      backdrop-filter: blur(8px);
+      padding: 14px 20px;
+      display: flex;
+      gap: 16px;
+      align-items: center;
+    }}
+    h1 {{ font-size: 18px; margin: 0; white-space: nowrap; }}
+    input {{
+      width: min(560px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 11px;
+      font-size: 14px;
+      background: var(--panel);
+      color: var(--ink);
+    }}
+    main {{ padding: 18px; display: grid; gap: 16px; max-width: 1300px; }}
+    .group {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }}
+    .query {{
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      padding: 10px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+    }}
+    .neighbors {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }}
+    .neighbor {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; }}
+    .meta {{ margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; color: var(--muted); font-size: 12px; }}
+    .pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 3px 7px; background: #fbfbf8; }}
+    .prompt {{ margin-top: 8px; white-space: pre-wrap; line-height: 1.35; font-size: 13px; }}
+    .path {{
+      margin-top: 8px;
+      color: var(--warn);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }}
+    .score {{ color: var(--accent); font-weight: 650; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{escaped_title}</h1>
+    <input id="search" placeholder="Filter by record, prompt, token kind, tag, or path">
+  </header>
+  <main id="content"></main>
+  <script>
+    const ROWS = {data};
+    const contentEl = document.getElementById("content");
+    const searchEl = document.getElementById("search");
+
+    function textOf(value) {{
+      if (value == null) return "";
+      if (Array.isArray(value)) return value.join(" ");
+      if (typeof value === "object") return JSON.stringify(value);
+      return String(value);
+    }}
+
+    function esc(value) {{
+      return textOf(value).replace(/[&<>"']/g, (c) => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[c]));
+    }}
+
+    function searchable(example) {{
+      const token = example.token_info || {{}};
+      return [
+        example.record_id, example.prompt, example.media_type, example.media_path,
+        example.tags, token.kind, token.token_text, token.text_context, token.visual_position
+      ].map(textOf).join(" ").toLowerCase();
+    }}
+
+    function tokenDetail(example) {{
+      const token = example.token_info || {{}};
+      const pos = token.visual_position || {{}};
+      if (token.kind === "text") {{
+        return `${{esc(token.token_text || "")}}${{token.text_context ? `<div class="path">${{esc(token.text_context)}}</div>` : ""}}`;
+      }}
+      if (token.visual_position) {{
+        return `frame ${{esc(pos.frame)}} - patch (${{esc(pos.patch_x)}}, ${{esc(pos.patch_y)}})`;
+      }}
+      return esc(token.token_text || "");
+    }}
+
+    function renderExample(example, cssClass, score) {{
+      const token = example.token_info || {{}};
+      const tags = Array.isArray(example.tags) ? example.tags : [];
+      const scoreHtml = score == null ? "" : `<span class="pill score">sim ${{Number(score).toFixed(4)}}</span>`;
+      return `
+        <article class="${{cssClass}}">
+          <strong>${{esc(example.record_id || "(unknown record)")}}</strong>
+          <div class="meta">
+            ${{scoreHtml}}
+            <span class="pill">${{esc(example.media_type || "unknown")}}</span>
+            <span class="pill">token ${{esc(example.token_index)}}</span>
+            ${{token.kind ? `<span class="pill">${{esc(token.kind)}}</span>` : ""}}
+            <span class="pill">${{esc(example.shard || "")}}</span>
+            ${{tags.map((tag) => `<span class="pill">${{esc(tag)}}</span>`).join("")}}
+          </div>
+          <div class="prompt">${{esc(example.prompt || "")}}</div>
+          ${{token.kind ? `<div class="path">${{tokenDetail(example)}}</div>` : ""}}
+          ${{example.media_path ? `<div class="path">${{esc(example.media_path)}}</div>` : ""}}
+        </article>
+      `;
+    }}
+
+    function render() {{
+      const q = searchEl.value.trim().toLowerCase();
+      const visible = ROWS.filter((row) => !q || searchable(row.query).includes(q) || row.neighbors.some((n) => searchable(n).includes(q)));
+      contentEl.innerHTML = visible.map((row, idx) => `
+        <section class="group">
+          <div class="query">
+            <div class="meta"><span class="pill">query ${{idx + 1}}</span></div>
+            ${{renderExample(row.query, "query-inner", null)}}
+          </div>
+          <div class="neighbors">
+            ${{row.neighbors.map((neighbor) => renderExample(neighbor, "neighbor", neighbor.similarity)).join("")}}
+          </div>
+        </section>
+      `).join("") || "<p>No matching neighbors.</p>";
+    }}
+
+    searchEl.addEventListener("input", render);
     render();
   </script>
 </body>

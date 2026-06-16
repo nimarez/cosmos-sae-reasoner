@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from tools.sae_reasoner.cli import build_parser, shard_name_for_record, shard_path_for_record
+import torch
+
+from tools.sae_reasoner.cli import build_parser, load_activation_examples, shard_name_for_record, shard_path_for_record
 
 
 def test_shard_path_escapes_dataset_style_ids(tmp_path: Path):
@@ -61,3 +63,35 @@ def test_render_feature_report_parser_defaults():
     args = parser.parse_args(["render-feature-report", "--features", "features.jsonl"])
 
     assert str(args.output) == "outputs/sae_reasoner/reports/features.html"
+
+
+def test_find_neighbors_parser_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["find-neighbors", "--activation-dir", "acts", "--output", "neighbors.jsonl"])
+
+    assert args.max_tokens == 5000
+    assert args.num_queries == 40
+    assert args.neighbors == 8
+
+
+def test_load_activation_examples_reservoir_samples(tmp_path: Path):
+    shard = tmp_path / "000000_rec.pt"
+    torch.save(
+        {
+            "activations": torch.eye(4),
+            "meta": {
+                "id": "rec",
+                "media_type": "image",
+                "prompt": "Describe.",
+                "token_map": [{"index": i, "kind": "image", "token_id": i, "token_text": "<|image_pad|>"} for i in range(4)],
+            },
+        },
+        shard,
+    )
+
+    examples, matrix = load_activation_examples(tmp_path, max_tokens=3, seed=0)
+
+    assert len(examples) == 3
+    assert matrix.shape == (3, 4)
+    assert all(example["record_id"] == "rec" for example in examples)
+    assert all((example["token_info"] or {})["kind"] == "image" for example in examples)

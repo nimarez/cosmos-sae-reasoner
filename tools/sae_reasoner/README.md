@@ -137,6 +137,18 @@ python -m tools.sae_reasoner render-feature-report \
   --features outputs/sae_reasoner/reports/l18_features.jsonl \
   --output outputs/sae_reasoner/reports/l18_features.html
 
+python -m tools.sae_reasoner find-neighbors \
+  --activation-dir outputs/sae_reasoner/activations/sample_l18 \
+  --output outputs/sae_reasoner/reports/l18_neighbors.jsonl \
+  --query-kinds image,video \
+  --max-tokens 5000 \
+  --num-queries 40 \
+  --neighbors 8
+
+python -m tools.sae_reasoner render-neighbor-report \
+  --neighbors outputs/sae_reasoner/reports/l18_neighbors.jsonl \
+  --output outputs/sae_reasoner/reports/l18_neighbors.html
+
 python -m tools.sae_reasoner steer \
   --model-id nvidia/Cosmos3-Nano \
   --sae outputs/sae_reasoner/saes/l18.pt \
@@ -177,6 +189,11 @@ and approximate frame/patch coordinates when the active processor exposes them.
 `metadata.jsonl` stays compact and stores only record-level metadata plus token
 kind counts and grid summaries. `find-features` reads the full shard token map
 and attaches the relevant token entry to each top activating feature example.
+
+`find-neighbors` uses the same token maps to build a pre-SAE nearest-neighbor
+browser over raw activation vectors. This is useful for checking whether local
+activation neighborhoods already group similar visual/text tokens before SAE
+training.
 
 ## Visualization
 
