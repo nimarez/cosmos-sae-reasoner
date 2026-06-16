@@ -188,7 +188,7 @@ def test_train_sae_parser_defaults_to_all_tokens():
     assert args.phases == ""
     assert args.topk_activation == "relu_topk"
     assert args.batch_topk_momentum == 0.01
-    assert args.init_method == "data"
+    assert args.init_method == "kaiming"
     assert args.init_blend == 0.8
     assert args.activation_norm == "sqrt_d"
     assert args.matryoshka_prefixes == ""
@@ -197,9 +197,9 @@ def test_train_sae_parser_defaults_to_all_tokens():
     assert args.val_splits == "sae_val"
     assert args.val_batch_size is None
     assert args.log_every == 10
-    assert args.warmup_steps == 200
-    assert args.lr_schedule == "cosine"
-    assert args.max_grad_norm == 1.0
+    assert args.warmup_steps == 0
+    assert args.lr_schedule == "constant"
+    assert args.max_grad_norm == 0.0
     assert args.wandb_project is None
     assert args.wandb_mode is None
 

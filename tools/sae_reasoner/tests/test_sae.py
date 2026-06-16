@@ -35,6 +35,15 @@ def test_batch_topk_sae_uses_batch_budget_and_eval_threshold():
     assert eval_features.shape == features.shape
 
 
+def test_topk_sae_kaiming_initialization_sets_decoder_transpose():
+    sae = TopKSAE(SAEConfig(input_dim=8, expansion_factor=2, top_k=3, init_method="kaiming"))
+
+    expected_decoder = sae.encoder.weight.T
+    expected_decoder = expected_decoder / expected_decoder.norm(dim=0, keepdim=True).clamp_min(1e-6)
+    assert torch.allclose(sae.decoder.weight, expected_decoder, atol=1e-5)
+    assert torch.allclose(sae.decoder.weight.norm(dim=0), torch.ones(16), atol=1e-5)
+
+
 def test_topk_sae_data_initialization_sets_decoder_transpose():
     sae = TopKSAE(SAEConfig(input_dim=8, expansion_factor=2, top_k=3))
     data = torch.randn(32, 8)

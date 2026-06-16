@@ -179,13 +179,12 @@ python -m tools.sae_reasoner train-sae \
   --output outputs/sae_reasoner/saes/l18.pt \
   --topk-activation relu_topk \
   --activation-norm sqrt_d \
-  --init-method data \
-  --init-blend 0.8 \
+  --init-method kaiming \
   --recon-loss mse \
   --feature-l1-coeff 0.0 \
-  --warmup-steps 200 \
-  --lr-schedule cosine \
-  --max-grad-norm 1 \
+  --warmup-steps 0 \
+  --lr-schedule constant \
+  --max-grad-norm 0 \
   --train-splits sae_train \
   --val-splits sae_val \
   --log-every 10 \
@@ -260,14 +259,14 @@ metrics for token classes such as `kind:video`, `kind:special`,
 `--wandb-project`, or set `WANDB_PROJECT` in the environment, to log the same
 metrics to W&B.
 
-SAE training defaults to ReLU+TopK activations and data-point blended
-initialization: sampled activation rows are zero-centered, blended with Kaiming
-vectors using `--init-blend 0.8`, copied into `W_enc`, and `W_dec` starts as the
-transpose with normalized decoder columns. Raw signed TopK remains available as
-an ablation with `--topk-activation topk`; `--init-method kaiming` is available
-as a fallback/control setting. BatchTopK is available as an opt-in experiment
-with `--topk-activation batch_topk`; do not use it for the first baseline unless
-you want variable per-example sparsity at inference via the learned threshold.
+SAE training defaults to ReLU+TopK activations and random parallel
+initialization: `W_enc` is Kaiming-initialized, `W_dec` starts as the transpose,
+and decoder columns are normalized. Data-point blended initialization remains
+available as an ablation with `--init-method data --init-blend 0.8`. Raw signed
+TopK remains available as an ablation with `--topk-activation topk`. BatchTopK
+is available as an opt-in experiment with `--topk-activation batch_topk`; do not
+use it for the first baseline unless you want variable per-example sparsity at
+inference via the learned threshold.
 
 Matryoshka SAE training is also available as an opt-in experiment with
 `--matryoshka-prefixes`. Pass comma-separated nested dictionary cutoffs as either

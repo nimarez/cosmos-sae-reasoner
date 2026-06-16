@@ -17,7 +17,7 @@ class SAEConfig:
     top_k: int = 32
     normalize_decoder: bool = True
     topk_activation: str = "relu_topk"
-    init_method: str = "data"
+    init_method: str = "kaiming"
     init_blend: float = 0.8
     input_scale: float = 1.0
     batch_topk_momentum: float = 0.01
@@ -39,8 +39,7 @@ class TopKSAE(nn.Module):
         self.register_buffer("batch_topk_threshold", torch.tensor(0.0))
         nn.init.kaiming_uniform_(self.encoder.weight, a=5**0.5)
         self._init_encoder_bias()
-        nn.init.kaiming_uniform_(self.decoder.weight, a=5**0.5)
-        self._renorm_decoder()
+        self._init_decoder_from_encoder()
 
     def scale_input(self, x: torch.Tensor) -> torch.Tensor:
         return x * float(self.config.input_scale)
@@ -63,6 +62,11 @@ class TopKSAE(nn.Module):
         weight = self.decoder.weight
         norms = weight.norm(dim=0, keepdim=True).clamp_min(1e-6)
         weight.div_(norms)
+
+    @torch.no_grad()
+    def _init_decoder_from_encoder(self) -> None:
+        self.decoder.weight.copy_(self.encoder.weight.T)
+        self._renorm_decoder()
 
     @torch.no_grad()
     def initialize_from_data(self, data: torch.Tensor, *, blend: float | None = None) -> None:
@@ -193,7 +197,7 @@ def train_sae_from_tensor(
     expansion_factor: int = 16,
     top_k: int = 32,
     topk_activation: str = "relu_topk",
-    init_method: str = "data",
+    init_method: str = "kaiming",
     init_blend: float = 0.8,
     activation_norm: str = "sqrt_d",
     batch_topk_momentum: float = 0.01,
