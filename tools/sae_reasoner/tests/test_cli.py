@@ -10,6 +10,7 @@ from tools.sae_reasoner.cli import (
     cmd_collect_activations,
     cmd_steer,
     collect_metric,
+    feature_frequency_summary,
     load_activation_dataset,
     load_activation_examples,
     load_activation_matrix,
@@ -204,6 +205,16 @@ def test_train_sae_parser_defaults_to_all_tokens():
     assert args.wandb_mode is None
 
 
+def test_analyze_sae_parser_defaults_to_train_and_val_splits():
+    parser = build_parser()
+    args = parser.parse_args(["analyze-sae", "--activation-dir", "acts", "--sae", "sae.pt", "--output", "analysis.json"])
+
+    assert args.splits == "sae_train,sae_val"
+    assert args.batch_size == 4096
+    assert args.token_kinds == ""
+    assert args.phases == ""
+
+
 def test_collect_metric_flattens_progress_counts():
     metric = collect_metric(
         idx=4,
@@ -234,6 +245,42 @@ def test_activation_meta_accounting_supports_resume_sidecars():
 
     assert activation_meta_tokens(meta) == 100
     assert activation_meta_bytes(meta) == 819200
+
+
+def test_feature_frequency_summary_reports_dead_fraction():
+    class DummyConfig:
+        input_dim = 4
+        expansion_factor = 2
+        top_k = 2
+        topk_activation = "relu_topk"
+        init_method = "kaiming"
+        input_scale = 1.0
+
+    class DummySAE:
+        config = DummyConfig()
+
+    class DummyData:
+        group_counts = {"all": 10}
+
+    fire_counts = torch.tensor([0, 2, 5, 10])
+    fire_rate = fire_counts.double() / 10
+
+    summary = feature_frequency_summary(
+        fire_counts=fire_counts,
+        fire_rate=fire_rate,
+        num_tokens=10,
+        data=DummyData(),
+        sae=DummySAE(),
+        activation_dir="acts",
+        sae_path="sae.pt",
+        filters={"splits": "sae_train"},
+        per_feature_path="analysis.features.jsonl",
+    )
+
+    assert summary["dead_features"] == 1
+    assert summary["live_features"] == 3
+    assert summary["dead_feature_frac"] == 0.25
+    assert summary["highest_fire_rate_features"][0]["feature_id"] == 3
 
 
 def test_steer_parser_supports_manifest_and_token_scope():

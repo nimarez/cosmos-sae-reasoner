@@ -259,6 +259,41 @@ metrics for token classes such as `kind:video`, `kind:special`,
 `--wandb-project`, or set `WANDB_PROJECT` in the environment, to log the same
 metrics to W&B.
 
+After training, run a full-dataset feature activity pass before selecting a
+checkpoint:
+
+```bash
+python -m tools.sae_reasoner analyze-sae \
+  --activation-dir "$ACTIVATION_URI" \
+  --sae outputs/sae_reasoner/saes/l18.pt \
+  --output outputs/sae_reasoner/reports/l18_feature_activity.json \
+  --splits sae_train,sae_val \
+  --batch-size 4096
+```
+
+This writes a summary JSON plus `<output>.features.jsonl` with per-feature
+firing counts, firing rates, sign counts, and activation magnitudes across the
+selected tokens. Use these full-dataset dead/rare-feature metrics alongside W&B
+training curves; batch-local `dead_feature_frac_batch` is only a dynamics signal.
+
+For the BridgeData synthetic-caption prefill dataset, start with the compact
+batch-size/LR sweep at 8x expansion rather than 16x:
+
+```bash
+python -m tools.sae_reasoner.scripts.plan_training_sweep \
+  --activation-dir "$ACTIVATION_URI" \
+  --output-root outputs/sae_reasoner/sweeps/bridgecaps_prefill \
+  --stage lr_batch \
+  --wandb-project "${WANDB_PROJECT:-cosmos-sae-reasoner}"
+```
+
+The generated script runs the 9 combinations of `batch_size={512,1024,2048}` and
+`lr={1e-4,3e-4,1e-3}` with `expansion_factor=8`, `top_k=32`, ReLU+TopK,
+Kaiming/parallel init, constant LR, and no gradient clipping. Each run is
+followed by `analyze-sae`. After picking the best batch/LR, generate later
+stages with `--stage capacity` for `expansion_factor={4,8,16}`, then
+`--stage topk` for `top_k={16,32,64}`, and only then `--stage ablations`.
+
 SAE training defaults to ReLU+TopK activations and random parallel
 initialization: `W_enc` is Kaiming-initialized, `W_dec` starts as the transpose,
 and decoder columns are normalized. Data-point blended initialization remains

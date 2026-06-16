@@ -144,6 +144,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--phases", default="", help="Optional comma-separated token phases to include. Empty means all.")
     p.set_defaults(func=cmd_find_features)
 
+    p = sub.add_parser("analyze-sae", help="compute full-dataset SAE feature firing statistics")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--sae", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True, help="Summary JSON path. Per-feature JSONL is written beside it.")
+    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--device", default=None)
+    p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to analyze. Empty means all.")
+    p.add_argument("--phases", default="", help="Optional comma-separated token phases to analyze. Empty means all.")
+    p.add_argument("--splits", default="sae_train,sae_val", help="Comma-separated manifest splits to analyze. Empty means all.")
+    p.set_defaults(func=cmd_analyze_sae)
+
     p = sub.add_parser("render-feature-report", help="render feature examples as a standalone HTML report")
     p.add_argument("--features", type=Path, required=True)
     p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/reports/features.html"))
@@ -742,6 +753,132 @@ def cmd_find_features(args: argparse.Namespace) -> int:
     write_jsonl(args.output, records[: max(args.top_n, len(feature_ids) * args.top_n)])
     print(json.dumps({"output": str(args.output), "num_records": len(records)}, indent=2))
     return 0
+
+
+def cmd_analyze_sae(args: argparse.Namespace) -> int:
+    import torch
+
+    from .sae import load_sae
+
+    data = load_activation_dataset(
+        args.activation_dir,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=parse_kind_filter(args.splits),
+    )
+    if data.activations is None:
+        raise ValueError(f"no activation shards found in {args.activation_dir}")
+    sae = load_sae(str(args.sae))
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    sae = sae.to(device)
+    sae.eval()
+    acts = data.activations
+    feature_dim = sae.config.feature_dim
+    fire_counts = torch.zeros(feature_dim, dtype=torch.long)
+    positive_counts = torch.zeros(feature_dim, dtype=torch.long)
+    negative_counts = torch.zeros(feature_dim, dtype=torch.long)
+    activation_abs_sum = torch.zeros(feature_dim, dtype=torch.float64)
+    activation_sum = torch.zeros(feature_dim, dtype=torch.float64)
+    batch_size = max(1, int(args.batch_size))
+    for start in range(0, acts.shape[0], batch_size):
+        batch = acts[start : start + batch_size].to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            features = sae.encode(batch).detach().cpu()
+        active = features != 0
+        fire_counts += active.sum(dim=0).to(dtype=torch.long)
+        positive_counts += (features > 0).sum(dim=0).to(dtype=torch.long)
+        negative_counts += (features < 0).sum(dim=0).to(dtype=torch.long)
+        activation_abs_sum += features.abs().sum(dim=0).to(dtype=torch.float64)
+        activation_sum += features.sum(dim=0).to(dtype=torch.float64)
+    num_tokens = int(acts.shape[0])
+    fire_rate = fire_counts.to(dtype=torch.float64) / max(1, num_tokens)
+    live_mask = fire_counts > 0
+    per_feature_path = args.output.with_suffix(".features.jsonl")
+    per_feature_records = []
+    for feature_id in range(feature_dim):
+        count = int(fire_counts[feature_id].item())
+        per_feature_records.append(
+            {
+                "feature_id": feature_id,
+                "fire_count": count,
+                "fire_rate": float(fire_rate[feature_id].item()),
+                "positive_count": int(positive_counts[feature_id].item()),
+                "negative_count": int(negative_counts[feature_id].item()),
+                "mean_activation": float(activation_sum[feature_id].item() / max(1, num_tokens)),
+                "mean_abs_activation": float(activation_abs_sum[feature_id].item() / max(1, num_tokens)),
+                "mean_abs_activation_when_active": float(activation_abs_sum[feature_id].item() / max(1, count)),
+            }
+        )
+    summary = feature_frequency_summary(
+        fire_counts=fire_counts,
+        fire_rate=fire_rate,
+        num_tokens=num_tokens,
+        data=data,
+        sae=sae,
+        activation_dir=str(args.activation_dir),
+        sae_path=str(args.sae),
+        filters={"token_kinds": args.token_kinds, "phases": args.phases, "splits": args.splits},
+        per_feature_path=str(per_feature_path),
+    )
+    ensure_dir(args.output.parent)
+    args.output.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    write_jsonl(per_feature_path, per_feature_records)
+    print(json.dumps({"output": str(args.output), "per_feature_output": str(per_feature_path), **summary}, indent=2))
+    return 0
+
+
+def feature_frequency_summary(
+    *,
+    fire_counts,
+    fire_rate,
+    num_tokens: int,
+    data: ActivationDataset,
+    sae,
+    activation_dir: str,
+    sae_path: str,
+    filters: dict[str, str],
+    per_feature_path: str,
+) -> dict[str, Any]:
+    import torch
+
+    feature_dim = int(fire_counts.numel())
+    live_mask = fire_counts > 0
+    sorted_rates, sorted_idx = torch.sort(fire_rate)
+    quantiles = {}
+    if feature_dim:
+        for label, q in [("p00", 0.0), ("p01", 0.01), ("p05", 0.05), ("p10", 0.10), ("p50", 0.50), ("p90", 0.90), ("p99", 0.99), ("p100", 1.0)]:
+            index = min(feature_dim - 1, max(0, int(round(q * (feature_dim - 1)))))
+            quantiles[label] = float(sorted_rates[index].item())
+    lowest_live = [
+        {"feature_id": int(idx.item()), "fire_count": int(fire_counts[idx].item()), "fire_rate": float(fire_rate[idx].item())}
+        for idx in sorted_idx[live_mask[sorted_idx]][:20]
+    ]
+    highest = [
+        {"feature_id": int(idx), "fire_count": int(fire_counts[idx].item()), "fire_rate": float(fire_rate[idx].item())}
+        for idx in reversed(sorted_idx[-20:].tolist())
+    ]
+    return {
+        "activation_dir": activation_dir,
+        "sae": sae_path,
+        "filters": filters,
+        "num_tokens": num_tokens,
+        "input_dim": int(sae.config.input_dim),
+        "feature_dim": feature_dim,
+        "expansion_factor": int(sae.config.expansion_factor),
+        "top_k": int(sae.config.top_k),
+        "topk_activation": sae.config.topk_activation,
+        "init_method": sae.config.init_method,
+        "input_scale": float(sae.config.input_scale),
+        "live_features": int(live_mask.sum().item()),
+        "dead_features": int((~live_mask).sum().item()),
+        "dead_feature_frac": float((~live_mask).to(dtype=torch.float32).mean().item()) if feature_dim else 0.0,
+        "mean_fire_rate": float(fire_rate.mean().item()) if feature_dim else 0.0,
+        "fire_rate_quantiles": quantiles,
+        "lowest_live_features": lowest_live,
+        "highest_fire_rate_features": highest,
+        "group_counts": data.group_counts,
+        "per_feature_output": per_feature_path,
+    }
 
 
 def compact_activation_meta(meta: dict[str, Any]) -> dict[str, Any]:
