@@ -16,7 +16,7 @@ class SAEConfig:
     expansion_factor: int = 16
     top_k: int = 32
     normalize_decoder: bool = True
-    topk_activation: str = "topk"
+    topk_activation: str = "relu_topk"
     init_method: str = "data"
     init_blend: float = 0.8
     input_scale: float = 1.0
@@ -192,7 +192,7 @@ def train_sae_from_tensor(
     validation_token_groups: Sequence[Sequence[str]] | None = None,
     expansion_factor: int = 16,
     top_k: int = 32,
-    topk_activation: str = "topk",
+    topk_activation: str = "relu_topk",
     init_method: str = "data",
     init_blend: float = 0.8,
     activation_norm: str = "sqrt_d",

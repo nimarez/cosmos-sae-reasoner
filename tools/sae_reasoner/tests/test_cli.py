@@ -186,7 +186,7 @@ def test_train_sae_parser_defaults_to_all_tokens():
 
     assert args.token_kinds == ""
     assert args.phases == ""
-    assert args.topk_activation == "topk"
+    assert args.topk_activation == "relu_topk"
     assert args.batch_topk_momentum == 0.01
     assert args.init_method == "data"
     assert args.init_blend == 0.8

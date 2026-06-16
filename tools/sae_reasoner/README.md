@@ -177,7 +177,7 @@ python -m tools.sae_reasoner collect-activations \
 python -m tools.sae_reasoner train-sae \
   --activation-dir "$ACTIVATION_URI" \
   --output outputs/sae_reasoner/saes/l18.pt \
-  --topk-activation topk \
+  --topk-activation relu_topk \
   --activation-norm sqrt_d \
   --init-method data \
   --init-blend 0.8 \
@@ -247,9 +247,9 @@ to log S3 shard-count progress from a sidecar process.
 `train-sae` and `find-neighbors` default to all token kinds and phases. Use
 optional filters such as `--token-kinds video,image`, `--phases decode`,
 `--query-kinds image,video`, or `find-features --token-kinds video,special` for
-control runs and media/special-token feature browsing. Because raw TopK
-features are signed, `find-features` ranks by `--feature-rank absolute` by
-default and still records the signed activation value.
+control runs and media/special-token feature browsing. If you explicitly train
+with raw signed TopK via `--topk-activation topk`, `find-features` can rank by
+`--feature-rank absolute` and still records the signed activation value.
 
 `train-sae` streams JSON metric rows during training and writes the same metrics
 to `<output>.metrics.jsonl`. Metrics include reconstruction loss, MSE,
@@ -260,14 +260,14 @@ metrics for token classes such as `kind:video`, `kind:special`,
 `--wandb-project`, or set `WANDB_PROJECT` in the environment, to log the same
 metrics to W&B.
 
-SAE training defaults to raw TopK activations and data-point blended
+SAE training defaults to ReLU+TopK activations and data-point blended
 initialization: sampled activation rows are zero-centered, blended with Kaiming
 vectors using `--init-blend 0.8`, copied into `W_enc`, and `W_dec` starts as the
-transpose with normalized decoder columns. `--topk-activation relu_topk` and
-`--init-method kaiming` are available as fallback/control settings. BatchTopK is
-available as an opt-in experiment with `--topk-activation batch_topk`; do not use
-it for the first baseline unless you want variable per-example sparsity at
-inference via the learned threshold.
+transpose with normalized decoder columns. Raw signed TopK remains available as
+an ablation with `--topk-activation topk`; `--init-method kaiming` is available
+as a fallback/control setting. BatchTopK is available as an opt-in experiment
+with `--topk-activation batch_topk`; do not use it for the first baseline unless
+you want variable per-example sparsity at inference via the learned threshold.
 
 Matryoshka SAE training is also available as an opt-in experiment with
 `--matryoshka-prefixes`. Pass comma-separated nested dictionary cutoffs as either

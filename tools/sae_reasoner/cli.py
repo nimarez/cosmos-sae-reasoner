@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--expansion-factor", type=int, default=16)
     p.add_argument("--top-k", type=int, default=32)
-    p.add_argument("--topk-activation", choices=["topk", "relu_topk", "batch_topk"], default="topk")
+    p.add_argument("--topk-activation", choices=["relu_topk", "topk", "batch_topk"], default="relu_topk")
     p.add_argument("--batch-topk-momentum", type=float, default=0.01, help="EMA momentum for BatchTopK inference threshold.")
     p.add_argument("--init-method", choices=["data", "kaiming"], default="data")
     p.add_argument("--init-blend", type=float, default=0.8, help="Data-point init blend p. Used when --init-method=data.")
