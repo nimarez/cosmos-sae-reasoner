@@ -12,6 +12,7 @@ def args(**overrides):
         "steps": 2000,
         "log_every": 50,
         "analysis_batch_size": 4096,
+        "python": ".venv/bin/python",
         "best_batch_size": 1024,
         "best_lr": 3e-4,
         "best_expansion_factor": 8,
@@ -48,4 +49,5 @@ def test_rendered_script_runs_analysis_after_each_train():
 
     assert "train-sae" in script
     assert "analyze-sae" in script
+    assert ".venv/bin/python -m tools.sae_reasoner train-sae" in script
     assert script.index("train-sae") < script.index("analyze-sae")

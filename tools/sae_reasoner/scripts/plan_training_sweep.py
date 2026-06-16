@@ -40,6 +40,7 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--analysis-batch-size", type=int, default=4096)
+    parser.add_argument("--python", default=".venv/bin/python", help="Python executable written into generated run scripts.")
     parser.add_argument("--best-batch-size", type=int, default=1024, help="Used for stages after lr_batch.")
     parser.add_argument("--best-lr", type=float, default=3e-4, help="Used for stages after lr_batch.")
     parser.add_argument("--best-expansion-factor", type=int, default=8, help="Used for stages after capacity.")
@@ -141,7 +142,7 @@ def render_script(configs: list[SweepConfig], args: argparse.Namespace) -> str:
 
 def render_run(config: SweepConfig, args: argparse.Namespace) -> list[str]:
     train = [
-        "python",
+        args.python,
         "-m",
         "tools.sae_reasoner",
         "train-sae",
@@ -191,7 +192,7 @@ def render_run(config: SweepConfig, args: argparse.Namespace) -> list[str]:
     if args.wandb_project:
         train.extend(["--wandb-project", args.wandb_project])
     analyze = [
-        "python",
+        args.python,
         "-m",
         "tools.sae_reasoner",
         "analyze-sae",
