@@ -3,6 +3,8 @@ from pathlib import Path
 import torch
 
 from tools.sae_reasoner.cli import (
+    activation_meta_bytes,
+    activation_meta_tokens,
     activation_sidecar_name,
     build_parser,
     cmd_collect_activations,
@@ -225,6 +227,13 @@ def test_collect_metric_flattens_progress_counts():
     assert metric["token_kind/video"] == 64
     assert metric["token_phase/decode"] == 10
     assert metric["activation_dtype"] == "bfloat16"
+
+
+def test_activation_meta_accounting_supports_resume_sidecars():
+    meta = {"num_tokens": 100, "hidden_dim": 4096, "activation_dtype": "bfloat16"}
+
+    assert activation_meta_tokens(meta) == 100
+    assert activation_meta_bytes(meta) == 819200
 
 
 def test_steer_parser_supports_manifest_and_token_scope():

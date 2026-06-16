@@ -422,13 +422,26 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
             wandb_run.log(metric, step=int(metric["collected_examples"]))
     metadata_text = "".join(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n" for record in metadata)
     metadata_uri = store.write_text("metadata.jsonl", metadata_text)
+    final_total_tokens = sum(activation_meta_tokens(record) for record in metadata)
+    final_total_activation_bytes = sum(activation_meta_bytes(record) for record in metadata)
+    summary = {
+        "event": "collect_complete",
+        "examples": len(metadata),
+        "new_examples": len(metadata) - skipped_examples,
+        "skipped_examples": skipped_examples,
+        "total_tokens": final_total_tokens,
+        "total_activation_gb": final_total_activation_bytes / 1_000_000_000,
+        "metadata_uri": metadata_uri,
+    }
+    print(json.dumps(summary, indent=2), flush=True)
     if wandb_run is not None:
         wandb_run.summary.update(
             {
                 "final_collected_examples": len(metadata),
+                "final_new_examples": len(metadata) - skipped_examples,
                 "final_skipped_examples": skipped_examples,
-                "final_total_tokens": total_tokens,
-                "final_total_activation_gb": total_activation_bytes / 1_000_000_000,
+                "final_total_tokens": final_total_tokens,
+                "final_total_activation_gb": final_total_activation_bytes / 1_000_000_000,
                 "metadata_uri": metadata_uri,
             }
         )
@@ -466,6 +479,24 @@ def collect_metric(
     for phase, count in token_phase_counts.items():
         metric[f"token_phase/{phase}"] = int(count)
     return metric
+
+
+def activation_meta_tokens(meta: dict[str, Any]) -> int:
+    return int(meta.get("num_tokens") or 0)
+
+
+def activation_meta_bytes(meta: dict[str, Any]) -> int:
+    tokens = activation_meta_tokens(meta)
+    hidden_dim = int(meta.get("hidden_dim") or 0)
+    return tokens * hidden_dim * activation_dtype_bytes(str(meta.get("activation_dtype") or ""))
+
+
+def activation_dtype_bytes(dtype: str) -> int:
+    if dtype in {"float32", "fp32"}:
+        return 4
+    if dtype in {"bfloat16", "bf16", "float16", "fp16"}:
+        return 2
+    return 0
 
 
 def cmd_train_sae(args: argparse.Namespace) -> int:
