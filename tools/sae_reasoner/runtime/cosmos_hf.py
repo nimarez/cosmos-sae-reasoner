@@ -14,6 +14,8 @@ from ..manifest import ManifestRecord
 from ..media import materialize_media_path
 
 PromptFormat = Literal["chat"]
+ActivationPhase = Literal["prefill", "decode", "both"]
+ActivationSaveDType = Literal["auto", "float32", "bfloat16", "float16"]
 
 
 class RuntimeLoadError(RuntimeError):
@@ -180,15 +182,17 @@ class CosmosReasonerRuntime:
         layer: int,
         prompt_format: PromptFormat = "chat",
         system_prompt: str | None = None,
+        activation_dtype: ActivationSaveDType = "bfloat16",
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.init_mode == "meta":
             raise RuntimeLoadError("init_mode=meta can inspect architecture but cannot collect activations")
         _, model = self.require_loaded()
         captures: list[torch.Tensor] = []
+        save_dtype = _resolve_activation_save_dtype(activation_dtype, self.dtype)
 
         def capture(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
             hidden = _extract_hidden(output)
-            captures.append(hidden.detach().float().cpu())
+            captures.append(_capture_activation(hidden, save_dtype))
 
         inputs, rendered_prompt = self.inputs_for_record(
             record,
@@ -217,11 +221,123 @@ class CosmosReasonerRuntime:
             "rendered_prompt": rendered_prompt,
             "num_tokens": int(hidden.shape[0]),
             "hidden_dim": int(hidden.shape[-1]),
+            "activation_dtype": str(hidden.dtype).replace("torch.", ""),
             "model_output_type": type(outputs).__name__,
             "input_summary": summarize_batch(inputs),
             "token_kind_counts": count_token_kinds(token_map),
             "visual_grid": token_meta.get("visual_grid"),
             "token_map": token_map,
+        }
+        return hidden, meta
+
+    @torch.no_grad()
+    def collect_activations(
+        self,
+        record: ManifestRecord,
+        *,
+        layer: int,
+        phase: ActivationPhase = "both",
+        max_new_tokens: int = 128,
+        prompt_format: PromptFormat = "chat",
+        system_prompt: str | None = None,
+        activation_dtype: ActivationSaveDType = "bfloat16",
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if phase not in {"prefill", "decode", "both"}:
+            raise ValueError("phase must be one of: prefill, decode, both")
+        if phase == "prefill":
+            hidden, meta = self.collect_prefill(
+                record,
+                layer=layer,
+                prompt_format=prompt_format,
+                system_prompt=system_prompt,
+                activation_dtype=activation_dtype,
+            )
+            meta["phase"] = "prefill"
+            meta["token_kind_counts"] = count_token_kinds(meta.get("token_map") or [])
+            meta["token_phase_counts"] = count_token_phases(meta.get("token_map") or [])
+            return hidden, meta
+        if self.init_mode == "meta":
+            raise RuntimeLoadError("init_mode=meta can inspect architecture but cannot collect activations")
+
+        processor, model = self.require_processor_and_model()
+        captures: list[tuple[str, torch.Tensor]] = []
+        save_dtype = _resolve_activation_save_dtype(activation_dtype, self.dtype)
+
+        def capture(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+            hidden = _capture_activation(_extract_hidden(output), save_dtype)
+            capture_phase = "prefill" if not captures else "decode"
+            captures.append((capture_phase, hidden))
+
+        inputs, rendered_prompt = self.inputs_for_record(
+            record,
+            prompt_format=prompt_format,
+            system_prompt=system_prompt,
+        )
+        prefill_token_map, token_meta = build_token_map(
+            processor=processor,
+            batch=inputs,
+            media_type=record.media_type,
+        )
+        with self._hook(layer, capture):
+            generated = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        if not captures:
+            raise RuntimeLoadError(f"no activation captured at layer {layer}")
+
+        prompt_len = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
+        generated_ids = _first_row(generated)
+        new_token_ids = generated_ids[prompt_len:] if prompt_len and len(generated_ids) >= prompt_len else generated_ids
+        generated_text = decode_tokens(processor, new_token_ids)
+
+        selected_activations: list[torch.Tensor] = []
+        selected_token_map: list[dict[str, Any]] = []
+        for capture_phase, capture_hidden in captures:
+            hidden = capture_hidden.squeeze(0)
+            if capture_phase == "prefill":
+                if phase in {"prefill", "both"}:
+                    selected_activations.append(hidden)
+                    selected_token_map.extend(mark_token_phase(prefill_token_map, phase="prefill"))
+                continue
+            decode_hidden = hidden.reshape(-1, hidden.shape[-1])
+            decode_token_map = build_decode_token_map(
+                processor=processor,
+                token_ids=new_token_ids,
+                start=len(selected_token_map),
+                offset=sum(1 for token in selected_token_map if token.get("phase") == "decode"),
+                count=decode_hidden.shape[0],
+            )
+            if phase in {"decode", "both"} and decode_token_map:
+                keep = min(decode_hidden.shape[0], len(decode_token_map))
+                selected_activations.append(decode_hidden[:keep])
+                selected_token_map.extend(decode_token_map[:keep])
+
+        if not selected_activations:
+            raise RuntimeLoadError(
+                f"no {phase} activations captured at layer {layer}; "
+                "decode-only collection may need max_new_tokens greater than 1"
+            )
+        hidden = torch.cat(selected_activations, dim=0)
+        meta = {
+            "id": record.id,
+            "media_type": record.media_type,
+            "prompt": record.prompt,
+            "prompt_format": prompt_format,
+            "system_prompt": system_prompt,
+            "phase": phase,
+            "media_path": record.media_path,
+            "tags": list(record.tags),
+            "metadata": record.metadata or {},
+            "rendered_prompt": rendered_prompt,
+            "generated_text": generated_text,
+            "generated_token_ids": new_token_ids,
+            "num_tokens": int(hidden.shape[0]),
+            "hidden_dim": int(hidden.shape[-1]),
+            "activation_dtype": str(hidden.dtype).replace("torch.", ""),
+            "model_output_type": type(generated).__name__,
+            "input_summary": summarize_batch(inputs),
+            "token_kind_counts": count_token_kinds(selected_token_map),
+            "token_phase_counts": count_token_phases(selected_token_map),
+            "visual_grid": token_meta.get("visual_grid"),
+            "token_map": selected_token_map,
         }
         return hidden, meta
 
@@ -260,6 +376,47 @@ class CosmosReasonerRuntime:
             return tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
         return str(generated)
 
+    @torch.no_grad()
+    def generate_for_record(
+        self,
+        record: ManifestRecord,
+        *,
+        layer: int | None = None,
+        edit_fn: Any | None = None,
+        max_new_tokens: int = 128,
+        prompt_format: PromptFormat = "chat",
+        system_prompt: str | None = None,
+    ) -> dict[str, Any]:
+        if self.init_mode == "meta":
+            raise RuntimeLoadError("init_mode=meta can inspect architecture but cannot generate")
+        processor, model = self.require_processor_and_model()
+        inputs, rendered_prompt = self.inputs_for_record(
+            record,
+            prompt_format=prompt_format,
+            system_prompt=system_prompt,
+        )
+        token_map, token_meta = build_token_map(
+            processor=processor,
+            batch=inputs,
+            media_type=record.media_type,
+        )
+        if edit_fn is not None and hasattr(edit_fn, "token_map") and getattr(edit_fn, "token_map") is None:
+            edit_fn.token_map = token_map
+        manager = self._hook(layer, edit_fn) if layer is not None and edit_fn is not None else contextlib.nullcontext()
+        with manager:
+            generated = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        prompt_len = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
+        generated_ids = _first_row(generated)
+        new_token_ids = generated_ids[prompt_len:] if prompt_len and len(generated_ids) >= prompt_len else generated_ids
+        return {
+            "text": decode_tokens(processor, new_token_ids),
+            "rendered_prompt": rendered_prompt,
+            "generated_token_ids": new_token_ids,
+            "token_kind_counts": count_token_kinds(token_map),
+            "token_phase_counts": count_token_phases(token_map),
+            "visual_grid": token_meta.get("visual_grid"),
+        }
+
     @contextlib.contextmanager
     def _hook(self, layer: int | None, fn: Any) -> Iterator[None]:
         if layer is None:
@@ -285,6 +442,25 @@ def _resolve_dtype(dtype: str) -> torch.dtype:
     if dtype in {"fp32", "float32"}:
         return torch.float32
     raise ValueError(f"unsupported dtype={dtype!r}")
+
+
+def _resolve_activation_save_dtype(dtype: ActivationSaveDType, model_dtype: torch.dtype) -> torch.dtype:
+    if dtype == "auto":
+        return model_dtype if model_dtype in {torch.bfloat16, torch.float16, torch.float32} else torch.float32
+    if dtype == "bfloat16":
+        return torch.bfloat16
+    if dtype == "float16":
+        return torch.float16
+    if dtype == "float32":
+        return torch.float32
+    raise ValueError("activation_dtype must be one of: auto, float32, bfloat16, float16")
+
+
+def _capture_activation(hidden: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    captured = hidden.detach()
+    if captured.dtype != dtype:
+        captured = captured.to(dtype=dtype)
+    return captured.cpu()
 
 
 @contextlib.contextmanager
@@ -366,13 +542,17 @@ def build_token_map(
     visual_grid = _visual_grid_metadata(processor, batch, media_type, mm_token_type_ids)
     visual_ordinal = 0
     tokens: list[dict[str, Any]] = []
+    role_state = ChatRoleState()
     for idx, token_id in enumerate(input_ids):
         token_text = _decode_token(tokenizer, token_id)
         is_visual = idx < len(mm_token_type_ids) and int(mm_token_type_ids[idx]) != 0
         kind = media_type if is_visual and media_type in {"image", "video"} else _token_kind(tokenizer, token_id, token_text)
+        role = role_state.update(token_text)
         entry: dict[str, Any] = {
             "index": idx,
             "kind": kind,
+            "phase": "prefill",
+            "role": role,
             "token_id": int(token_id),
             "token_text": token_text,
         }
@@ -407,6 +587,83 @@ def count_token_kinds(token_map: list[dict[str, Any]]) -> dict[str, int]:
         kind = str(token.get("kind", "unknown"))
         counts[kind] = counts.get(kind, 0) + 1
     return counts
+
+
+def count_token_phases(token_map: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for token in token_map:
+        phase = str(token.get("phase", "unknown"))
+        counts[phase] = counts.get(phase, 0) + 1
+    return counts
+
+
+class ChatRoleState:
+    def __init__(self) -> None:
+        self.current: str | None = None
+        self.expect_role = False
+
+    def update(self, token_text: str) -> str | None:
+        role = self.current
+        if "<|im_start|>" in token_text:
+            self.expect_role = True
+            self.current = None
+            return None
+        stripped = token_text.strip()
+        if self.expect_role and stripped in {"system", "user", "assistant"}:
+            self.current = stripped
+            self.expect_role = False
+            return self.current
+        if "<|im_end|>" in token_text:
+            role = self.current
+            self.current = None
+            self.expect_role = False
+            return role
+        return self.current
+
+
+def mark_token_phase(token_map: list[dict[str, Any]], *, phase: str) -> list[dict[str, Any]]:
+    return [{**token, "index": idx, "phase": phase} for idx, token in enumerate(token_map)]
+
+
+def build_decode_token_map(
+    *,
+    processor: Any | None,
+    token_ids: list[int],
+    start: int,
+    offset: int,
+    count: int,
+    context_radius: int = 8,
+) -> list[dict[str, Any]]:
+    tokenizer = getattr(processor, "tokenizer", None)
+    selected = token_ids[offset : offset + count]
+    out: list[dict[str, Any]] = []
+    for local_idx, token_id in enumerate(selected):
+        token_text = _decode_token(tokenizer, token_id)
+        generated_index = offset + local_idx
+        entry = {
+            "index": start + local_idx,
+            "kind": _token_kind(tokenizer, token_id, token_text),
+            "phase": "decode",
+            "role": "assistant",
+            "token_id": int(token_id),
+            "token_text": token_text,
+            "generated_index": int(generated_index),
+        }
+        if entry["kind"] == "text":
+            entry["text_context"] = _decode_window(tokenizer, token_ids, generated_index, context_radius)
+        out.append(entry)
+    return out
+
+
+def decode_tokens(processor: Any | None, token_ids: list[int]) -> str:
+    if not token_ids:
+        return ""
+    if processor is not None and hasattr(processor, "batch_decode"):
+        return processor.batch_decode([token_ids], skip_special_tokens=True)[0]
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer.batch_decode([token_ids], skip_special_tokens=True)[0]
+    return " ".join(str(token_id) for token_id in token_ids)
 
 
 def load_video_frames(path: str, *, max_frames: int | None = None) -> Any:

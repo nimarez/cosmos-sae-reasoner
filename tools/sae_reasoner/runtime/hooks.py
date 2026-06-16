@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Sequence
 
 import torch
 
 from ..sae import TopKSAE
 
 Scope = Literal["prefill", "decode", "both"]
-Mode = Literal["multiply", "clamp"]
 
 
 @dataclass
@@ -17,7 +16,9 @@ class FeatureSteeringHook:
     feature_id: int
     multiplier: float
     scope: Scope = "decode"
-    mode: Mode = "multiply"
+    token_map: Sequence[dict[str, Any]] | None = None
+    token_kinds: frozenset[str] = frozenset()
+    roles: frozenset[str] = frozenset()
     call_index: int = 0
 
     def __call__(self, _module: torch.nn.Module, _inputs: tuple, output):
@@ -27,15 +28,38 @@ class FeatureSteeringHook:
         if self.scope != "both" and self.scope != phase:
             return output
         flat = hidden.reshape(-1, hidden.shape[-1]).float()
+        edit_mask = self._edit_mask(phase, flat.device, flat.shape[0])
+        if edit_mask is not None and not bool(edit_mask.any()):
+            return output
         sae = self.sae.to(device=flat.device)
-        delta = sae.feature_delta(
-            flat,
-            feature_id=self.feature_id,
-            multiplier=self.multiplier,
-            mode=self.mode,
-        ).to(dtype=hidden.dtype)
+        if edit_mask is None:
+            delta = sae.feature_delta(
+                flat,
+                feature_id=self.feature_id,
+                multiplier=self.multiplier,
+            ).to(dtype=hidden.dtype)
+        else:
+            delta = torch.zeros_like(flat, dtype=hidden.dtype)
+            delta[edit_mask] = sae.feature_delta(
+                flat[edit_mask],
+                feature_id=self.feature_id,
+                multiplier=self.multiplier,
+            ).to(dtype=hidden.dtype)
         edited = hidden + delta.reshape_as(hidden)
         return _replace_hidden(output, edited)
+
+    def _edit_mask(self, phase: str, device: torch.device, length: int) -> torch.Tensor | None:
+        if not self.token_kinds and not self.roles:
+            return None
+        if phase != "prefill" or not self.token_map:
+            return torch.zeros(length, dtype=torch.bool, device=device)
+        values = []
+        for token in list(self.token_map)[:length]:
+            kind_ok = not self.token_kinds or str(token.get("kind") or "") in self.token_kinds
+            role_ok = not self.roles or str(token.get("role") or "") in self.roles
+            values.append(kind_ok and role_ok)
+        values.extend([False] * max(0, length - len(values)))
+        return torch.tensor(values[:length], dtype=torch.bool, device=device)
 
 
 def _extract_hidden(output) -> torch.Tensor:
@@ -62,4 +86,3 @@ def _replace_hidden(output, hidden: torch.Tensor):
         except Exception:
             return hidden
     return hidden
-

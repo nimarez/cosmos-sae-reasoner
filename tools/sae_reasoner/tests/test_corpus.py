@@ -11,12 +11,22 @@ from tools.sae_reasoner.corpus import (
     build_from_s3_prefix,
     parse_split_ratios,
     s3_key_for_tar_member,
+    split_for_record_id,
 )
 
 
 def test_parse_split_ratios_normalizes():
     ratios = parse_split_ratios("train=9,label=1")
     assert ratios == (("train", 0.9), ("label", 0.1))
+
+
+def test_split_for_record_id_is_extension_stable():
+    ratios = parse_split_ratios("train=0.85,val=0.10,label=0.05")
+    first = {f"rec-{idx}": split_for_record_id(f"rec-{idx}", 7, ratios) for idx in range(100)}
+    extended = {f"rec-{idx}": split_for_record_id(f"rec-{idx}", 7, ratios) for idx in range(1000)}
+
+    assert {key: extended[key] for key in first} == first
+    assert split_for_record_id("rec-1", 8, ratios) in {"train", "val", "label"}
 
 
 def test_build_from_hf_files_uses_remote_media(monkeypatch):
@@ -64,7 +74,16 @@ def test_robotics_recipe_uses_loose_videos(monkeypatch, tmp_path: Path):
                 "sft_dataset_bridge/val/videos_5frames/episode_000015_clip000.mp4",
             ]
 
-    fake_module = types.SimpleNamespace(HfApi=lambda: FakeHfApi())
+    caption_path = tmp_path / "caption.txt"
+    caption_path.write_text("A real per-clip robot caption.", encoding="utf-8")
+
+    def fake_download(repo_id: str, repo_type: str, filename: str):
+        assert repo_id == "nvidia/BridgeData2-Subset-Synthetic-Captions"
+        assert repo_type == "dataset"
+        assert filename == "sft_dataset_bridge/train/captions/episode_000015_clip000/caption.txt"
+        return str(caption_path)
+
+    fake_module = types.SimpleNamespace(HfApi=lambda: FakeHfApi(), hf_hub_download=fake_download)
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
 
     output = tmp_path / "robotics.jsonl"
@@ -84,6 +103,8 @@ def test_robotics_recipe_uses_loose_videos(monkeypatch, tmp_path: Path):
         "hf://dataset/nvidia/BridgeData2-Subset-Synthetic-Captions/"
         "sft_dataset_bridge/train/videos/episode_000015_clip000.mp4"
     )
+    assert records[0]["prompt"] == "A real per-clip robot caption."
+    assert records[0]["metadata"]["prompt_source"] == "sidecar"
     assert "robotics" in records[0]["tags"]
 
 

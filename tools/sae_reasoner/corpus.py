@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import random
@@ -28,6 +29,7 @@ class CorpusRecipe:
     include_globs: tuple[str, ...] = ()
     member_globs: tuple[str, ...] = ()
     prompt: str = ""
+    prompt_sidecar: str | None = None
     tags: tuple[str, ...] = ()
     notes: str = ""
 
@@ -42,7 +44,7 @@ RECIPES: dict[str, CorpusRecipe] = {
             "Describe the traffic scene, the relevant agents, and the likely next physical events. "
             "Use visible evidence and avoid speculating beyond the clip."
         ),
-        tags=("cosmos3", "physicalai", "driving", "video", "sae_train"),
+        tags=("cosmos3", "physicalai", "driving", "video"),
         notes="Direct MP4 files with sidecar descriptions in the HF repo.",
     ),
     "physicalai-vantage": CorpusRecipe(
@@ -54,7 +56,7 @@ RECIPES: dict[str, CorpusRecipe] = {
             "Describe the scene with attention to spatial relations, visible objects, and physical affordances. "
             "If a task is implied by the path, answer in that style without using hidden annotations."
         ),
-        tags=("physicalai", "vantage", "image", "spatial", "sae_train"),
+        tags=("physicalai", "vantage", "image", "spatial"),
         notes="Evaluation-style image tasks. Keep held-out portions separate from training if used for eval.",
     ),
     "robotics-bridge": CorpusRecipe(
@@ -66,7 +68,7 @@ RECIPES: dict[str, CorpusRecipe] = {
             "Describe the robot manipulation episode, including the visible objects, end-effector motion, "
             "contact events, and likely task outcome."
         ),
-        tags=("physicalai", "robotics", "bridge", "lerobot", "video", "sae_train"),
+        tags=("physicalai", "robotics", "bridge", "lerobot", "video"),
         notes="Loose MP4 files from the BridgeData2 LeRobot release.",
     ),
     "robotics-bridge-captions": CorpusRecipe(
@@ -78,7 +80,8 @@ RECIPES: dict[str, CorpusRecipe] = {
             "Describe the robot manipulation clip in detail. Focus on object state, gripper pose, "
             "physical interactions, and what action should happen next."
         ),
-        tags=("physicalai", "robotics", "bridge", "synthetic_captions", "video", "sae_train"),
+        prompt_sidecar="sft_dataset_bridge/{hf_split}/captions/{stem}/caption.txt",
+        tags=("physicalai", "robotics", "bridge", "synthetic_captions", "video"),
         notes="BridgeData2 subset with loose MP4 clips and synthetic captions.",
     ),
     "robotics-libero": CorpusRecipe(
@@ -90,7 +93,7 @@ RECIPES: dict[str, CorpusRecipe] = {
             "Describe the robot tabletop task, visible objects, gripper trajectory, contact dynamics, "
             "and the likely next step needed to complete the instruction."
         ),
-        tags=("physicalai", "robotics", "libero", "lerobot", "video", "sae_train"),
+        tags=("physicalai", "robotics", "libero", "lerobot", "video"),
         notes="Loose MP4 files from the LIBERO LeRobot release.",
     ),
     "physicalai-robotsim": CorpusRecipe(
@@ -103,7 +106,7 @@ RECIPES: dict[str, CorpusRecipe] = {
             "Describe the robot simulation clip, including the embodiment, scene objects, robot motion, "
             "contacts, collisions, and likely physical outcome."
         ),
-        tags=("cosmos3", "physicalai", "robotics", "robotsim", "video", "sae_train"),
+        tags=("cosmos3", "physicalai", "robotics", "robotsim", "video"),
         notes="Cosmos RobotSim SDG tar shards. Materialize a bounded sample to S3 before activation collection.",
     ),
 }
@@ -126,7 +129,7 @@ class BuildCorpusConfig:
     max_shards: int | None = 1
     max_shard_gb: float | None = 1.0
     seed: int = 0
-    split_ratios: tuple[tuple[str, float], ...] = (("sae_train", 0.9), ("feature_labeling", 0.05), ("steering_eval", 0.05))
+    split_ratios: tuple[tuple[str, float], ...] = (("sae_train", 0.85), ("sae_val", 0.10), ("feature_labeling", 0.025), ("steering_eval", 0.025))
     id_field: str | None = None
     text_field: str | None = None
     prompt_field: str | None = None
@@ -146,6 +149,7 @@ def build_corpus_manifest(config: BuildCorpusConfig) -> list[dict[str, Any]]:
                 repo_id=required(recipe.repo_id, "recipe repo_id"),
                 include_globs=recipe.include_globs,
                 prompt=config.prompt or recipe.prompt,
+                prompt_sidecar=None if config.prompt else recipe.prompt_sidecar,
                 tags=recipe.tags,
                 max_records=config.max_records,
                 seed=config.seed,
@@ -174,6 +178,7 @@ def build_corpus_manifest(config: BuildCorpusConfig) -> list[dict[str, Any]]:
             repo_id=required(config.hf_repo_id, "--hf-repo-id"),
             include_globs=config.include_globs,
             prompt=required(config.prompt, "--prompt"),
+            prompt_sidecar=None,
             tags=("hf", "external"),
             max_records=config.max_records,
             seed=config.seed,
@@ -217,6 +222,7 @@ def build_from_hf_files(
     seed: int,
     split_ratios: tuple[tuple[str, float], ...],
     media_type: str,
+    prompt_sidecar: str | None = None,
 ) -> list[dict[str, Any]]:
     try:
         from huggingface_hub import HfApi
@@ -228,14 +234,25 @@ def build_from_hf_files(
     rng.shuffle(candidates)
     records: list[dict[str, Any]] = []
     for idx, path in enumerate(candidates[:max_records]):
-        split = split_for_index(idx, max_records, split_ratios)
+        record_id = f"hf:{repo_id}:{path}"
+        split = split_for_record_id(record_id, seed, split_ratios)
         inferred = infer_media_type(path, media_type)
+        template_values = hf_template_values(path=path, repo_id=repo_id)
+        sidecar_path = render_template(prompt_sidecar, **template_values) if prompt_sidecar else None
+        prompt_text = render_template(prompt, **template_values)
+        prompt_source = "template"
+        if sidecar_path and sidecar_path in files:
+            from huggingface_hub import hf_hub_download
+
+            sidecar_file = Path(hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=sidecar_path))
+            prompt_text = sidecar_file.read_text(encoding="utf-8").strip()
+            prompt_source = "sidecar"
         record_tags = sorted(set(tags + (split,) + tags_from_path(path)))
         records.append(
             make_manifest_dict(
                 record_id=f"hf:{repo_id}:{path}",
                 media_type=inferred,
-                prompt=render_template(prompt, path=path, stem=Path(path).stem, repo_id=repo_id),
+                prompt=prompt_text,
                 media_path=f"hf://dataset/{repo_id}/{path}",
                 tags=record_tags,
                 metadata={
@@ -243,6 +260,8 @@ def build_from_hf_files(
                     "source_uri": f"hf://dataset/{repo_id}/{path}",
                     "repo_id": repo_id,
                     "path": path,
+                    "prompt_source": prompt_source,
+                    "prompt_sidecar": sidecar_path,
                     "split": split,
                 },
             )
@@ -270,8 +289,8 @@ def build_from_hf_dataset(config: BuildCorpusConfig) -> list[dict[str, Any]]:
 
 
 def manifest_from_dataset_row(row_idx: int, row: dict[str, Any], config: BuildCorpusConfig, repo_id: str) -> dict[str, Any] | None:
-    split = split_for_index(row_idx, config.max_records, config.split_ratios)
     record_id = str(row.get(config.id_field, f"hf:{repo_id}:{config.hf_split}:{row_idx}")) if config.id_field else f"hf:{repo_id}:{config.hf_split}:{row_idx}"
+    split = split_for_record_id(record_id, config.seed, config.split_ratios)
     media_path = value_as_path(row.get(config.media_field)) if config.media_field else None
     if media_path:
         media_type = infer_media_type(media_path, config.media_type)
@@ -351,7 +370,8 @@ def build_from_hf_tar_s3(
                 extracted = tar.extractfile(member)
                 if extracted is None:
                     continue
-                split = split_for_index(len(records), max_records, split_ratios)
+                record_id = f"hf-tar:{repo_id}:{shard}:{member.name}"
+                split = split_for_record_id(record_id, seed, split_ratios)
                 key = s3_key_for_tar_member(prefix, repo_slug, shard, member.name)
                 with extracted:
                     s3.upload_fileobj(
@@ -364,7 +384,7 @@ def build_from_hf_tar_s3(
                 record_tags = sorted(set(tags + (split,) + tags_from_path(shard) + tags_from_path(member.name)))
                 records.append(
                     make_manifest_dict(
-                        record_id=f"hf-tar:{repo_id}:{shard}:{member.name}",
+                        record_id=record_id,
                         media_type=infer_media_type(member.name, media_type),
                         prompt=render_template(prompt, path=member.name, stem=Path(member.name).stem, repo_id=repo_id, shard=shard),
                         media_path=media_path,
@@ -440,10 +460,11 @@ def build_from_s3_prefix(config: BuildCorpusConfig) -> list[dict[str, Any]]:
     prompt = required(config.prompt, "--prompt")
     records: list[dict[str, Any]] = []
     for idx, key in enumerate(candidates):
-        split = split_for_index(idx, len(candidates), config.split_ratios)
+        record_id = f"s3:{bucket}:{key}"
+        split = split_for_record_id(record_id, config.seed, config.split_ratios)
         records.append(
             make_manifest_dict(
-                record_id=f"s3:{bucket}:{key}",
+                record_id=record_id,
                 media_type=infer_media_type(key, config.media_type),
                 prompt=render_template(prompt, path=key, stem=Path(key).stem, repo_id=bucket),
                 media_path=f"s3://{bucket}/{key}",
@@ -503,6 +524,7 @@ def build_from_jsonl_uri(uri: str, config: BuildCorpusConfig) -> list[dict[str, 
         metadata.setdefault("source", "jsonl")
         metadata.setdefault("source_uri", uri)
         metadata.setdefault("row_index", idx)
+        metadata.setdefault("split", split_for_record_id(str(obj["id"]), config.seed, config.split_ratios))
         obj["metadata"] = metadata
         record = ManifestRecord.from_json(obj)
         records.append(record.to_json())
@@ -609,6 +631,19 @@ def split_for_index(index: int, total: int, ratios: tuple[tuple[str, float], ...
     return ratios[-1][0]
 
 
+def split_for_record_id(record_id: str, seed: int, ratios: tuple[tuple[str, float], ...]) -> str:
+    if not ratios:
+        return "sae_train"
+    digest = hashlib.sha256(f"{seed}:{record_id}".encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big") / float(1 << 64)
+    acc = 0.0
+    for name, ratio in ratios:
+        acc += ratio
+        if value < acc:
+            return name
+    return ratios[-1][0]
+
+
 def parse_split_ratios(raw: str) -> tuple[tuple[str, float], ...]:
     pairs: list[tuple[str, float]] = []
     for part in raw.split(","):
@@ -633,6 +668,19 @@ def tags_from_path(path: str) -> tuple[str, ...]:
         if clean and not clean.endswith((".jpg", ".jpeg", ".png", ".mp4", ".json")):
             useful.append(clean)
     return tuple(useful)
+
+
+def hf_template_values(*, path: str, repo_id: str) -> dict[str, str]:
+    parts = PurePosixPath(path).parts
+    hf_split = ""
+    if len(parts) >= 3 and parts[0] == "sft_dataset_bridge":
+        hf_split = parts[1]
+    return {
+        "path": path,
+        "stem": PurePosixPath(path).stem,
+        "repo_id": repo_id,
+        "hf_split": hf_split,
+    }
 
 
 def render_template(template: str, **values: str) -> str:

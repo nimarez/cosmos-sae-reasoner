@@ -3,7 +3,13 @@ import torch
 import numpy as np
 
 from tools.sae_reasoner.manifest import ManifestRecord
-from tools.sae_reasoner.runtime.cosmos_hf import build_token_map, render_record_prompt, render_text_prompt
+from tools.sae_reasoner.runtime.cosmos_hf import (
+    _capture_activation,
+    _resolve_activation_save_dtype,
+    build_token_map,
+    render_record_prompt,
+    render_text_prompt,
+)
 
 
 class FakeProcessor:
@@ -33,6 +39,15 @@ def test_render_record_prompt_rejects_non_chat_format():
 
     with pytest.raises(ValueError, match="chat"):
         render_record_prompt(FakeProcessor(), record, prompt_format="raw")
+
+
+def test_activation_capture_can_preserve_bfloat16():
+    hidden = torch.randn(1, 3, 4, dtype=torch.float32)
+    captured = _capture_activation(hidden, _resolve_activation_save_dtype("bfloat16", torch.bfloat16))
+
+    assert captured.device.type == "cpu"
+    assert captured.dtype == torch.bfloat16
+    assert _resolve_activation_save_dtype("auto", torch.float16) == torch.float16
 
 
 def test_render_chat_prompt_includes_system_prompt():
@@ -71,9 +86,12 @@ def test_build_token_map_marks_visual_tokens_and_positions():
     token_map, meta = build_token_map(processor=FakeProcessor(), batch=batch, media_type="image")
 
     assert token_map[0]["kind"] == "special"
+    assert token_map[0]["phase"] == "prefill"
     assert token_map[1]["kind"] == "text"
+    assert token_map[1]["phase"] == "prefill"
     assert token_map[1]["text_context"] == "<|im_start|> robot<|image_pad|><|image_pad|><|image_pad|><|image_pad|> pushes<|im_end|>"
     assert token_map[2]["kind"] == "image"
+    assert token_map[2]["phase"] == "prefill"
     assert token_map[2]["visual_position"] == {
         "frame": 0,
         "patch_y": 0,

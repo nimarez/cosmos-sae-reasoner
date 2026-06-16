@@ -16,9 +16,16 @@ def render_feature_report(features_path: Path, output: Path, *, title: str = "Co
         grouped[str(row.get("feature_id", "unknown"))].append(row)
     features = []
     for feature_id, examples in sorted(grouped.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]):
-        examples.sort(key=lambda row: float(row.get("activation", 0.0)), reverse=True)
-        max_activation = max((float(row.get("activation", 0.0)) for row in examples), default=0.0)
-        features.append({"feature_id": feature_id, "max_activation": max_activation, "examples": examples})
+        examples.sort(key=lambda row: float(row.get("activation_score", abs(float(row.get("activation", 0.0))))), reverse=True)
+        max_activation = max((abs(float(row.get("activation", 0.0))) for row in examples), default=0.0)
+        features.append(
+            {
+                "feature_id": feature_id,
+                "max_activation": max_activation,
+                "breakdown": feature_breakdown(examples),
+                "examples": examples,
+            }
+        )
     ensure_dir(output.parent)
     output.write_text(render_html(features, title=title), encoding="utf-8")
 
@@ -27,6 +34,35 @@ def render_neighbor_report(neighbors_path: Path, output: Path, *, title: str = "
     rows = read_jsonl(neighbors_path)
     ensure_dir(output.parent)
     output.write_text(render_neighbor_html(rows, title=title), encoding="utf-8")
+
+
+def feature_breakdown(examples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return token_breakdown(examples)
+
+
+def token_breakdown(examples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: dict[str, int] = defaultdict(int)
+    for row in examples:
+        token = row.get("token_info") or {}
+        phase = token.get("phase") or "unknown"
+        kind = token.get("kind") or "unknown"
+        counts[f"{phase}:{kind}"] += 1
+    total = max(1, len(examples))
+    return [
+        {"label": label, "count": count, "fraction": count / total}
+        for label, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def neighbor_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    queries = [row.get("query") or {} for row in rows]
+    neighbors = [neighbor for row in rows for neighbor in row.get("neighbors", [])]
+    return {
+        "query_count": len(queries),
+        "neighbor_count": len(neighbors),
+        "query_breakdown": token_breakdown(queries),
+        "neighbor_breakdown": token_breakdown(neighbors),
+    }
 
 
 def render_html(features: list[dict[str, Any]], *, title: str) -> str:
@@ -195,13 +231,26 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
       padding: 3px 7px;
       background: #fbfbf8;
     }}
-    .path {{
+	    .path {{
       margin-top: 10px;
       color: var(--warn);
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
-      overflow-wrap: anywhere;
-    }}
+	      overflow-wrap: anywhere;
+	    }}
+	    .breakdown {{
+	      display: grid;
+	      gap: 6px;
+	      margin-bottom: 18px;
+	    }}
+	    .breakdown-row {{
+	      display: grid;
+	      grid-template-columns: 150px minmax(0, 1fr) 64px;
+	      gap: 8px;
+	      align-items: center;
+	      color: var(--muted);
+	      font-size: 12px;
+	    }}
     @media (max-width: 820px) {{
       main {{ grid-template-columns: 1fr; }}
       aside {{ position: static; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); }}
@@ -277,10 +326,19 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
       contentEl.innerHTML = `
         <div class="summary">
           <div class="metric"><div class="label">Feature</div><div class="value">${{esc(feature.feature_id)}}</div></div>
-          <div class="metric"><div class="label">Examples</div><div class="value">${{feature.examples.length}}</div></div>
-          <div class="metric"><div class="label">Max activation</div><div class="value">${{Number(feature.max_activation || 0).toFixed(3)}}</div></div>
-        </div>
-        <div class="examples">
+	          <div class="metric"><div class="label">Examples</div><div class="value">${{feature.examples.length}}</div></div>
+	          <div class="metric"><div class="label">Max |activation|</div><div class="value">${{Number(feature.max_activation || 0).toFixed(3)}}</div></div>
+	        </div>
+	        <div class="breakdown">
+	          ${{(feature.breakdown || []).map((row) => `
+	            <div class="breakdown-row">
+	              <span>${{esc(row.label)}}</span>
+	              <div class="bar"><span style="width:${{Math.max(2, Math.min(100, 100 * Number(row.fraction || 0)))}}%"></span></div>
+	              <span>${{esc(row.count)}} ex</span>
+	            </div>
+	          `).join("")}}
+	        </div>
+	        <div class="examples">
           ${{feature.examples.map((row) => renderExample(row, max)).join("")}}
         </div>
       `;
@@ -288,7 +346,7 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
 
     function renderExample(row, max) {{
       const activation = Number(row.activation || 0);
-      const width = Math.max(2, Math.min(100, 100 * activation / max));
+      const width = Math.max(2, Math.min(100, 100 * Math.abs(activation) / max));
       const tags = Array.isArray(row.tags) ? row.tags : [];
       const mediaPath = row.media_path || row.metadata?.source_uri || "";
       const token = row.token_info || {{}};
@@ -310,9 +368,11 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
           <div class="prompt">${{esc(row.prompt || "")}}</div>
           <div class="meta">
             <span class="pill">${{esc(row.media_type || "unknown")}}</span>
-            <span class="pill">token ${{esc(row.token_index)}}</span>
-            ${{token.kind ? `<span class="pill">${{esc(token.kind)}}</span>` : ""}}
-            <span class="pill">${{esc(row.shard || "")}}</span>
+	            <span class="pill">token ${{esc(row.token_index)}}</span>
+	            ${{token.kind ? `<span class="pill">${{esc(token.kind)}}</span>` : ""}}
+	            ${{token.phase ? `<span class="pill">${{esc(token.phase)}}</span>` : ""}}
+	            ${{token.role ? `<span class="pill">${{esc(token.role)}}</span>` : ""}}
+	            <span class="pill">${{esc(row.shard || "")}}</span>
             ${{tags.map((tag) => `<span class="pill">${{esc(tag)}}</span>`).join("")}}
           </div>
           ${{token.kind ? `<div class="path">${{tokenDetail}}</div>` : ""}}
@@ -338,6 +398,7 @@ def render_html(features: list[dict[str, Any]], *, title: str) -> str:
 
 def render_neighbor_html(rows: list[dict[str, Any]], *, title: str) -> str:
     data = json.dumps(rows, ensure_ascii=True)
+    summary_data = json.dumps(neighbor_summary(rows), ensure_ascii=True)
     escaped_title = html.escape(title)
     return f"""<!doctype html>
 <html lang="en">
@@ -386,6 +447,20 @@ def render_neighbor_html(rows: list[dict[str, Any]], *, title: str) -> str:
       color: var(--ink);
     }}
     main {{ padding: 18px; display: grid; gap: 16px; max-width: 1300px; }}
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+    }}
+    .metric {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }}
+    .metric .label {{ color: var(--muted); font-size: 12px; margin-bottom: 4px; }}
+    .metric .value {{ font-size: 20px; font-weight: 650; }}
+    .breakdown {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }}
     .group {{
       background: var(--panel);
       border: 1px solid var(--line);
@@ -422,6 +497,7 @@ def render_neighbor_html(rows: list[dict[str, Any]], *, title: str) -> str:
   <main id="content"></main>
   <script>
     const ROWS = {data};
+    const SUMMARY = {summary_data};
     const contentEl = document.getElementById("content");
     const searchEl = document.getElementById("search");
 
@@ -440,8 +516,12 @@ def render_neighbor_html(rows: list[dict[str, Any]], *, title: str) -> str:
       const token = example.token_info || {{}};
       return [
         example.record_id, example.prompt, example.media_type, example.media_path,
-        example.tags, token.kind, token.token_text, token.text_context, token.visual_position
+        example.tags, token.kind, token.phase, token.role, token.token_text, token.text_context, token.visual_position
       ].map(textOf).join(" ").toLowerCase();
+    }}
+
+    function renderBreakdown(rows) {{
+      return rows.map((row) => `<span class="pill">${{esc(row.label)}} ${{esc(row.count)}}</span>`).join("");
     }}
 
     function tokenDetail(example) {{
@@ -465,10 +545,12 @@ def render_neighbor_html(rows: list[dict[str, Any]], *, title: str) -> str:
           <strong>${{esc(example.record_id || "(unknown record)")}}</strong>
           <div class="meta">
             ${{scoreHtml}}
-            <span class="pill">${{esc(example.media_type || "unknown")}}</span>
-            <span class="pill">token ${{esc(example.token_index)}}</span>
-            ${{token.kind ? `<span class="pill">${{esc(token.kind)}}</span>` : ""}}
-            <span class="pill">${{esc(example.shard || "")}}</span>
+	            <span class="pill">${{esc(example.media_type || "unknown")}}</span>
+	            <span class="pill">token ${{esc(example.token_index)}}</span>
+	            ${{token.kind ? `<span class="pill">${{esc(token.kind)}}</span>` : ""}}
+	            ${{token.phase ? `<span class="pill">${{esc(token.phase)}}</span>` : ""}}
+	            ${{token.role ? `<span class="pill">${{esc(token.role)}}</span>` : ""}}
+	            <span class="pill">${{esc(example.shard || "")}}</span>
             ${{tags.map((tag) => `<span class="pill">${{esc(tag)}}</span>`).join("")}}
           </div>
           <div class="prompt">${{esc(example.prompt || "")}}</div>
@@ -481,7 +563,25 @@ def render_neighbor_html(rows: list[dict[str, Any]], *, title: str) -> str:
     function render() {{
       const q = searchEl.value.trim().toLowerCase();
       const visible = ROWS.filter((row) => !q || searchable(row.query).includes(q) || row.neighbors.some((n) => searchable(n).includes(q)));
-      contentEl.innerHTML = visible.map((row, idx) => `
+      const summaryHtml = `
+        <section class="summary">
+          <div class="metric">
+            <div class="label">Queries</div>
+            <div class="value">${{esc(SUMMARY.query_count || 0)}}</div>
+            <div class="breakdown">${{renderBreakdown(SUMMARY.query_breakdown || [])}}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Neighbors</div>
+            <div class="value">${{esc(SUMMARY.neighbor_count || 0)}}</div>
+            <div class="breakdown">${{renderBreakdown(SUMMARY.neighbor_breakdown || [])}}</div>
+          </div>
+          <div class="metric">
+            <div class="label">Visible query groups</div>
+            <div class="value">${{esc(visible.length)}}</div>
+          </div>
+        </section>
+      `;
+      contentEl.innerHTML = summaryHtml + (visible.map((row, idx) => `
         <section class="group">
           <div class="query">
             <div class="meta"><span class="pill">query ${{idx + 1}}</span></div>
@@ -491,7 +591,7 @@ def render_neighbor_html(rows: list[dict[str, Any]], *, title: str) -> str:
             ${{row.neighbors.map((neighbor) => renderExample(neighbor, "neighbor", neighbor.similarity)).join("")}}
           </div>
         </section>
-      `).join("") || "<p>No matching neighbors.</p>";
+      `).join("") || "<p>No matching neighbors.</p>");
     }}
 
     searchEl.addEventListener("input", render);

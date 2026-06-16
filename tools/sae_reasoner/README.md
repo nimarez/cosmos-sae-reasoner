@@ -51,6 +51,10 @@ python -m tools.sae_reasoner build-corpus-manifest \
 `physicalai-driving` and `physicalai-vantage` remain available, but the default
 SAE notebook is robotics-focused.
 
+The `robotics-bridge-captions` recipe pairs each video with the repo's
+per-clip `caption.txt` sidecar when available. Passing `--prompt` overrides
+that and falls back to a fixed template.
+
 Cosmos RobotSim SDG is tar-sharded on Hugging Face, so use a bounded
 materialization step to extract a small sample of MP4s to S3 and write a normal
 manifest:
@@ -145,27 +149,50 @@ python -m tools.sae_reasoner collect-activations \
   --manifest outputs/sae_reasoner/sample_manifest.jsonl \
   --layer 18 \
   --output-dir outputs/sae_reasoner/activations/sample_l18 \
+  --phase both \
+  --max-new-tokens 128 \
+  --activation-dtype bfloat16 \
   --max-examples 8
 
-# Save activation shards directly to S3. Credentials are read from the
-# environment by boto3: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, optional
-# AWS_SESSION_TOKEN, and AWS_DEFAULT_REGION.
+# Real runs should save activation shards directly to S3. Credentials are read
+# from the environment by boto3: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+# optional AWS_SESSION_TOKEN, and AWS_DEFAULT_REGION.
+export COSMOS_SAE_ACTIVATION_S3_URI="${COSMOS_SAE_ACTIVATION_S3_URI:-s3://cosmos-interpretability/sae_reasoner/activations}"
+ACTIVATION_URI="${COSMOS_SAE_ACTIVATION_S3_URI%/}/sample_l18"
+
 python -m tools.sae_reasoner collect-activations \
   --model-id nvidia/Cosmos3-Nano \
   --manifest outputs/sae_reasoner/sample_manifest.jsonl \
   --layer 18 \
-  --output-dir s3://my-bucket/cosmos/sae_reasoner/activations/sample_l18 \
+  --output-dir "$ACTIVATION_URI" \
+  --phase both \
+  --max-new-tokens 128 \
+  --activation-dtype bfloat16 \
+  --resume \
+  --wandb-project "${WANDB_PROJECT:-cosmos-sae-reasoner}" \
+  --wandb-run-name sample_l18_collect \
+  --wandb-tags collection,cosmos3,sae \
   --max-examples 8
 
 python -m tools.sae_reasoner train-sae \
-  --activation-dir outputs/sae_reasoner/activations/sample_l18 \
+  --activation-dir "$ACTIVATION_URI" \
   --output outputs/sae_reasoner/saes/l18.pt \
+  --topk-activation topk \
+  --activation-norm sqrt_d \
+  --init-method data \
+  --init-blend 0.8 \
   --recon-loss mse \
   --feature-l1-coeff 0.0 \
+  --warmup-steps 200 \
+  --lr-schedule cosine \
+  --max-grad-norm 1 \
+  --train-splits sae_train \
+  --val-splits sae_val \
+  --log-every 10 \
   --steps 500
 
 python -m tools.sae_reasoner find-features \
-  --activation-dir outputs/sae_reasoner/activations/sample_l18 \
+  --activation-dir "$ACTIVATION_URI" \
   --sae outputs/sae_reasoner/saes/l18.pt \
   --output outputs/sae_reasoner/reports/l18_features.jsonl
 
@@ -174,9 +201,8 @@ python -m tools.sae_reasoner render-feature-report \
   --output outputs/sae_reasoner/reports/l18_features.html
 
 python -m tools.sae_reasoner find-neighbors \
-  --activation-dir outputs/sae_reasoner/activations/sample_l18 \
+  --activation-dir "$ACTIVATION_URI" \
   --output outputs/sae_reasoner/reports/l18_neighbors.jsonl \
-  --query-kinds image,video \
   --max-tokens 5000 \
   --num-queries 40 \
   --neighbors 8
@@ -191,9 +217,70 @@ python -m tools.sae_reasoner steer \
   --layer 18 \
   --feature-id 0 \
   --multiplier 5 \
-  --scope decode \
-  --prompt "What is the robot likely to do next?"
+  --scope prefill \
+  --manifest outputs/sae_reasoner/manifests/robotics_l18_5000.jsonl \
+  --record-id physical_plausibility \
+  --steer-token-kinds video \
+  --steer-roles user
 ```
+
+`collect-activations` defaults to `--phase both`, so shards include prompt/media
+prefill tokens and generated assistant decode tokens when generation produces
+them. Decode activations are important for steering demos, so use prefill-only
+collection mainly for speed/control runs. Saved shards default to
+`--activation-dtype bfloat16` to avoid doubling GPU-to-CPU transfer and S3
+storage; `train-sae` keeps loaded activations in their stored dtype and casts
+sampled mini-batches to float32 for optimization.
+When W&B is enabled, collection logs live progress metrics including collected
+examples, total tokens, per-record seconds, examples/minute, tokens/second,
+estimated activation GB, token-kind counts, and token-phase counts.
+Use `--resume` with a frozen manifest to skip records whose deterministic shard
+and `metadata/<shard>.json` sidecar already exist. This makes interrupted runs
+and later extensions idempotent: build a larger manifest with the same source
+and seed, point at the same activation prefix, increase `--max-examples`, and
+existing rows are skipped by shard name. Manifest splits are assigned by a
+stable hash of `record_id` plus seed, so train/validation labels do not change
+when a manifest is extended.
+For an already-running S3 collection that was launched without W&B, use
+`python -m tools.sae_reasoner.scripts.monitor_s3_collection --activation-dir s3://bucket/prefix --target-examples 5000 --wandb-project cosmos-sae-reasoner`
+to log S3 shard-count progress from a sidecar process.
+`train-sae` and `find-neighbors` default to all token kinds and phases. Use
+optional filters such as `--token-kinds video,image`, `--phases decode`,
+`--query-kinds image,video`, or `find-features --token-kinds video,special` for
+control runs and media/special-token feature browsing. Because raw TopK
+features are signed, `find-features` ranks by `--feature-rank absolute` by
+default and still records the signed activation value.
+
+`train-sae` streams JSON metric rows during training and writes the same metrics
+to `<output>.metrics.jsonl`. Metrics include reconstruction loss, MSE,
+explained variance, L0, dead-feature fraction on the current batch, gradient
+norm, learning rate, tokens seen, elapsed seconds, and grouped reconstruction
+metrics for token classes such as `kind:video`, `kind:special`,
+`phase_kind:prefill:video`, and `role:user`. Set `WANDB_API_KEY` and pass
+`--wandb-project`, or set `WANDB_PROJECT` in the environment, to log the same
+metrics to W&B.
+
+SAE training defaults to raw TopK activations and data-point blended
+initialization: sampled activation rows are zero-centered, blended with Kaiming
+vectors using `--init-blend 0.8`, copied into `W_enc`, and `W_dec` starts as the
+transpose with normalized decoder columns. `--topk-activation relu_topk` and
+`--init-method kaiming` are available as fallback/control settings. BatchTopK is
+available as an opt-in experiment with `--topk-activation batch_topk`; do not use
+it for the first baseline unless you want variable per-example sparsity at
+inference via the learned threshold.
+
+Training also defaults to `--activation-norm sqrt_d`, which scales raw residual
+activations inside the SAE so their average L2 norm is `sqrt(hidden_dim)`. The
+saved SAE stores that scale and unscales reconstruction deltas, so steering hooks
+still edit the model's raw residual stream.
+
+By default, manifests use separate splits for SAE optimization, reconstruction
+validation, feature browsing, and final steering checks:
+`sae_train=0.85,sae_val=0.10,feature_labeling=0.025,steering_eval=0.025`.
+`train-sae` trains only on `sae_train` and computes held-out validation metrics
+only on `sae_val`. `feature_labeling` and `steering_eval` are reserved for
+downstream interpretation and steering demos, not for overfitting checks. Shards
+without split metadata are treated as `sae_train` for backward compatibility.
 
 ## Manifest Format
 
@@ -217,10 +304,11 @@ environment variables.
 ## Token Maps
 
 Activation shards include a `token_map` in their saved metadata. Each token
-entry stores the token index, token id, decoded token text, and a token kind:
-`text`, `special`, `image`, or `video`. For image/video tokens, the collector
-also saves processor grid metadata such as `image_grid_thw`/`video_grid_thw`
-and approximate frame/patch coordinates when the active processor exposes them.
+entry stores the token index, token id, decoded token text, token phase
+(`prefill` or `decode`), approximate chat role, and token kind: `text`,
+`special`, `image`, or `video`. For image/video tokens, the collector also saves
+processor grid metadata such as `image_grid_thw`/`video_grid_thw` and
+approximate frame/patch coordinates when the active processor exposes them.
 
 `metadata.jsonl` stays compact and stores only record-level metadata plus token
 kind counts and grid summaries. `find-features` reads the full shard token map
@@ -230,6 +318,12 @@ and attaches the relevant token entry to each top activating feature example.
 browser over raw activation vectors. This is useful for checking whether local
 activation neighborhoods already group similar visual/text tokens before SAE
 training.
+
+Feature steering can run either from a text-only `--prompt` or from a manifest
+record via `--manifest` and `--record-id`. Manifest steering uses the same
+Cosmos chat-template/media path as activation collection. `--steer-token-kinds`
+and `--steer-roles` restrict prefill edits to specific token classes, which is
+useful for media-token or special-token steering sweeps.
 
 ## Visualization
 

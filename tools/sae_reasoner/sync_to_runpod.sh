@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-REMOTE_HOST="${COSMOS_SAE_RUNPOD_HOST:-root@64.119.209.250}"
-REMOTE_PORT="${COSMOS_SAE_RUNPOD_PORT:-11792}"
+if [[ -z "${COSMOS_SAE_RUNPOD_HOST:-}" ]]; then
+  echo "COSMOS_SAE_RUNPOD_HOST is required, for example root@140.82.47.249 or cosmos-sae-runpod" >&2
+  exit 2
+fi
+if [[ -z "${COSMOS_SAE_RUNPOD_PORT:-}" ]]; then
+  echo "COSMOS_SAE_RUNPOD_PORT is required for direct SSH targets; set it to 22 when using an SSH config host alias" >&2
+  exit 2
+fi
+
+REMOTE_HOST="$COSMOS_SAE_RUNPOD_HOST"
+REMOTE_PORT="$COSMOS_SAE_RUNPOD_PORT"
 REMOTE_DIR="${COSMOS_SAE_RUNPOD_DIR:-/workspace/cosmos-sae-reasoner/tools/sae_reasoner/}"
 SSH_KEY="${COSMOS_SAE_RUNPOD_SSH_KEY:-$HOME/.runpod/ssh/runpodctl-ssh-key}"
 INTERVAL_SECONDS="${COSMOS_SAE_SYNC_INTERVAL:-3}"

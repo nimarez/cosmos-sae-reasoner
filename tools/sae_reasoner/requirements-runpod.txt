@@ -10,6 +10,7 @@ pillow
 pytest
 safetensors
 transformers>=4.57.0
+wandb
 
 # Helpful for Qwen/Cosmos-style video processing if the active processor uses it.
 imageio
