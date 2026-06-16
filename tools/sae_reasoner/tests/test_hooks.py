@@ -15,6 +15,12 @@ def test_feature_steering_hook_tuple_output_shape():
 
 def test_feature_steering_hook_can_target_prefill_token_kind():
     sae = TopKSAE(SAEConfig(input_dim=6, expansion_factor=2, top_k=12))
+    with torch.no_grad():
+        sae.encoder.weight.zero_()
+        sae.encoder.bias.zero_()
+        sae.encoder.weight[0, 0] = 1.0
+        sae.decoder.weight.zero_()
+        sae.decoder.weight[0, 0] = 1.0
     hook = FeatureSteeringHook(
         sae=sae,
         feature_id=0,
@@ -28,7 +34,7 @@ def test_feature_steering_hook_can_target_prefill_token_kind():
         token_kinds=frozenset({"video"}),
         roles=frozenset({"user"}),
     )
-    hidden = torch.randn(1, 3, 6)
+    hidden = torch.tensor([[[2.0, 0.0, 0.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])
     output = hook(torch.nn.Identity(), (), (hidden,))
 
     delta = output[0] - hidden
