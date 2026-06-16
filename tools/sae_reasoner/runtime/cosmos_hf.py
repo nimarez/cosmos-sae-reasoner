@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from dataclasses import dataclass, replace
 from typing import Any, Iterator, Literal
 
@@ -159,9 +160,7 @@ class CosmosReasonerRuntime:
 
             kwargs["images"] = [Image.open(materialized_media_path).convert("RGB")]
         elif record.media_type == "video":
-            # Qwen3VLProcessor-backed runtimes commonly accept videos here.
-            # If a given install does not, the error is clearer at this boundary.
-            kwargs["videos"] = [materialized_media_path]
+            kwargs["videos"] = [load_video_frames(materialized_media_path)]
         try:
             batch = processor(**kwargs)
         except Exception as exc:  # pragma: no cover - processor-specific
@@ -403,6 +402,47 @@ def count_token_kinds(token_map: list[dict[str, Any]]) -> dict[str, int]:
         kind = str(token.get("kind", "unknown"))
         counts[kind] = counts.get(kind, 0) + 1
     return counts
+
+
+def load_video_frames(path: str, *, max_frames: int | None = None) -> Any:
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # pragma: no cover - optional runtime dependency
+        raise RuntimeLoadError("video records require opencv-python-headless for frame decoding") from exc
+
+    frame_limit = max_frames or int(os.environ.get("COSMOS_SAE_VIDEO_FRAMES", "16"))
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeLoadError(f"could not open video file: {path}")
+    try:
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if frame_count > 0:
+            if frame_count <= frame_limit:
+                indices = list(range(frame_count))
+            else:
+                indices = np.linspace(0, frame_count - 1, frame_limit).round().astype(int).tolist()
+            frames = []
+            for index in indices:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, frame = capture.read()
+                if ok:
+                    frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        else:
+            frames = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if len(frames) > frame_limit:
+                indices = np.linspace(0, len(frames) - 1, frame_limit).round().astype(int).tolist()
+                frames = [frames[index] for index in indices]
+    finally:
+        capture.release()
+    if not frames:
+        raise RuntimeLoadError(f"could not decode frames from video file: {path}")
+    return np.stack(frames, axis=0)
 
 
 def _first_row(value: Any) -> list[int]:

@@ -156,9 +156,11 @@ or expected concepts are used during collection.
 {"id":"robot_caption","media_type":"image","media_path":"cookbooks/cosmos3/reasoner/assets/robot_153.jpg","prompt":"Caption the image in detail.","tags":["robotics"],"metadata":{"split":"sae_train"}}
 ```
 
-Supported `media_type` values are `text`, `image`, and `video`. Video support
-depends on the installed processor; if the current Cosmos runtime cannot ingest
-video directly, the loader fails with a clear error.
+Supported `media_type` values are `text`, `image`, and `video`. Video records
+are decoded to RGB frames with OpenCV before they are passed to the Cosmos
+processor, avoiding runtime-specific `torchvision`/`torchcodec` video IO. The
+collector samples up to `COSMOS_SAE_VIDEO_FRAMES` frames per video, defaulting
+to `16`.
 
 Remote `media_path` values can use `hf://dataset/<namespace>/<repo>/<path>`,
 `s3://bucket/key`, or HTTPS URLs. S3 credentials are read from the standard AWS
