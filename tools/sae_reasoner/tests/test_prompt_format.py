@@ -1,5 +1,6 @@
 import pytest
 import torch
+import numpy as np
 
 from tools.sae_reasoner.manifest import ManifestRecord
 from tools.sae_reasoner.runtime.cosmos_hf import build_token_map, render_record_prompt, render_text_prompt
@@ -83,3 +84,63 @@ def test_build_token_map_marks_visual_tokens_and_positions():
     assert token_map[5]["visual_position"]["patch_x"] == 1
     assert token_map[5]["visual_position"]["patch_y"] == 1
     assert meta["visual_grid"]["merged_grid_thw"] == [1, 2, 2]
+
+
+def test_load_video_frames_preserves_metadata(monkeypatch):
+    from tools.sae_reasoner.runtime import cosmos_hf
+
+    class FakeCapture:
+        def __init__(self, path):
+            self.pos = 0
+            self.frames = [np.full((2, 2, 3), i, dtype=np.uint8) for i in range(4)]
+
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            values = {
+                fake_cv2.CAP_PROP_FRAME_COUNT: 4,
+                fake_cv2.CAP_PROP_FPS: 20.0,
+                fake_cv2.CAP_PROP_FRAME_WIDTH: 2,
+                fake_cv2.CAP_PROP_FRAME_HEIGHT: 2,
+            }
+            return values.get(prop, 0)
+
+        def set(self, prop, value):
+            self.pos = int(value)
+
+        def read(self):
+            if self.pos >= len(self.frames):
+                return False, None
+            frame = self.frames[self.pos]
+            self.pos += 1
+            return True, frame
+
+        def release(self):
+            pass
+
+    class FakeCv2:
+        CAP_PROP_FRAME_COUNT = 1
+        CAP_PROP_FPS = 2
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_POS_FRAMES = 5
+        COLOR_BGR2RGB = 6
+        VideoCapture = FakeCapture
+
+        @staticmethod
+        def cvtColor(frame, code):
+            return frame
+
+    fake_cv2 = FakeCv2()
+    monkeypatch.setitem(__import__("sys").modules, "cv2", fake_cv2)
+
+    frames, metadata = cosmos_hf.load_video_frames_with_metadata("x.mp4", max_frames=2)
+
+    assert frames.shape == (2, 2, 2, 3)
+    assert metadata.total_num_frames == 2
+    assert metadata.fps == 20.0
+    assert metadata.width == 2
+    assert metadata.height == 2
+    assert metadata.video_backend == "opencv"
+    assert metadata.frames_indices == [0, 3]

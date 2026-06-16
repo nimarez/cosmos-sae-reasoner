@@ -160,7 +160,9 @@ class CosmosReasonerRuntime:
 
             kwargs["images"] = [Image.open(materialized_media_path).convert("RGB")]
         elif record.media_type == "video":
-            kwargs["videos"] = [load_video_frames(materialized_media_path)]
+            video_frames, video_metadata = load_video_frames_with_metadata(materialized_media_path)
+            kwargs["videos"] = [video_frames]
+            kwargs["video_metadata"] = [video_metadata]
         try:
             batch = processor(**kwargs)
         except Exception as exc:  # pragma: no cover - processor-specific
@@ -405,9 +407,15 @@ def count_token_kinds(token_map: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def load_video_frames(path: str, *, max_frames: int | None = None) -> Any:
+    frames, _metadata = load_video_frames_with_metadata(path, max_frames=max_frames)
+    return frames
+
+
+def load_video_frames_with_metadata(path: str, *, max_frames: int | None = None) -> tuple[Any, Any]:
     try:
         import cv2
         import numpy as np
+        from transformers.video_utils import VideoMetadata
     except Exception as exc:  # pragma: no cover - optional runtime dependency
         raise RuntimeLoadError("video records require opencv-python-headless for frame decoding") from exc
 
@@ -417,11 +425,16 @@ def load_video_frames(path: str, *, max_frames: int | None = None) -> Any:
         raise RuntimeLoadError(f"could not open video file: {path}")
     try:
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0) or None
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) or None
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0) or None
+        sampled_indices: list[int] = []
         if frame_count > 0:
             if frame_count <= frame_limit:
                 indices = list(range(frame_count))
             else:
                 indices = np.linspace(0, frame_count - 1, frame_limit).round().astype(int).tolist()
+            sampled_indices = [int(index) for index in indices]
             frames = []
             for index in indices:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, index)
@@ -437,12 +450,25 @@ def load_video_frames(path: str, *, max_frames: int | None = None) -> Any:
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if len(frames) > frame_limit:
                 indices = np.linspace(0, len(frames) - 1, frame_limit).round().astype(int).tolist()
+                sampled_indices = [int(index) for index in indices]
                 frames = [frames[index] for index in indices]
+            else:
+                sampled_indices = list(range(len(frames)))
     finally:
         capture.release()
     if not frames:
         raise RuntimeLoadError(f"could not decode frames from video file: {path}")
-    return np.stack(frames, axis=0)
+    duration = float(frame_count / fps) if frame_count and fps else None
+    metadata = VideoMetadata(
+        total_num_frames=len(frames),
+        fps=fps,
+        width=width,
+        height=height,
+        duration=duration,
+        video_backend="opencv",
+        frames_indices=sampled_indices,
+    )
+    return np.stack(frames, axis=0), metadata
 
 
 def _first_row(value: Any) -> list[int]:
