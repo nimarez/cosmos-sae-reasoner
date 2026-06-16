@@ -189,6 +189,8 @@ def test_train_sae_parser_defaults_to_all_tokens():
     assert args.init_method == "data"
     assert args.init_blend == 0.8
     assert args.activation_norm == "sqrt_d"
+    assert args.matryoshka_prefixes == ""
+    assert args.matryoshka_loss_coeff == 1.0
     assert args.train_splits == "sae_train"
     assert args.val_splits == "sae_val"
     assert args.val_batch_size is None

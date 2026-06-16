@@ -269,6 +269,14 @@ available as an opt-in experiment with `--topk-activation batch_topk`; do not us
 it for the first baseline unless you want variable per-example sparsity at
 inference via the learned threshold.
 
+Matryoshka SAE training is also available as an opt-in experiment with
+`--matryoshka-prefixes`. Pass comma-separated nested dictionary cutoffs as either
+absolute feature counts or fractions of the full dictionary, for example
+`--matryoshka-prefixes 0.03125,0.0625,0.125,0.25,0.5`. The full-dictionary
+reconstruction loss remains the main `recon_loss`; each smaller prefix adds an
+extra reconstruction loss scaled by `--matryoshka-loss-coeff`. Leave
+`--matryoshka-prefixes` empty for the first baseline.
+
 Training also defaults to `--activation-norm sqrt_d`, which scales raw residual
 activations inside the SAE so their average L2 norm is `sqrt(hidden_dim)`. The
 saved SAE stores that scale and unscales reconstruction deltas, so steering hooks

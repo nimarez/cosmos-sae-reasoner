@@ -6,7 +6,9 @@ from tools.sae_reasoner.sae import (
     activation_l2_scale,
     load_sae,
     lr_for_step,
+    matryoshka_reconstruction_loss,
     reconstruction_loss,
+    resolve_matryoshka_prefixes,
     save_sae,
     train_sae_from_tensor,
 )
@@ -169,6 +171,51 @@ def test_train_sae_accepts_bfloat16_activations_without_persistent_fp32_input():
 
     assert sae.config.input_dim == 8
     assert metrics[-1]["step"] == 2.0
+
+
+def test_resolve_matryoshka_prefixes_accepts_counts_and_fractions():
+    assert resolve_matryoshka_prefixes("0.25,8,1.0", feature_dim=16) == (4, 8, 16)
+
+
+def test_matryoshka_reconstruction_loss_uses_decoder_prefixes():
+    sae = TopKSAE(SAEConfig(input_dim=2, expansion_factor=2, top_k=4))
+    with torch.no_grad():
+        sae.decoder.weight.zero_()
+        sae.decoder.weight[:, 0] = torch.tensor([1.0, 0.0])
+        sae.decoder.weight[:, 1] = torch.tensor([0.0, 1.0])
+        sae.decoder.weight[:, 2] = torch.tensor([1.0, 1.0])
+        sae.post_bias.zero_()
+    features = torch.tensor([[2.0, 3.0, 5.0, 7.0]])
+    target = torch.tensor([[2.0, 3.0]])
+
+    loss, by_prefix = matryoshka_reconstruction_loss(sae, features, target, prefixes=(1, 2, 4), recon_loss="mse")
+
+    assert torch.isclose(by_prefix[1], torch.tensor(4.5))
+    assert torch.isclose(by_prefix[2], torch.tensor(0.0))
+    assert 4 not in by_prefix
+    assert torch.isclose(loss, torch.tensor(4.5))
+
+
+def test_train_sae_supports_opt_in_matryoshka_loss():
+    acts = torch.randn(64, 8)
+
+    sae, metrics = train_sae_from_tensor(
+        acts,
+        expansion_factor=2,
+        top_k=2,
+        matryoshka_prefixes=(4, 8),
+        matryoshka_loss_coeff=0.5,
+        steps=2,
+        batch_size=16,
+        device="cpu",
+        log_every=1,
+    )
+
+    assert sae.config.matryoshka_prefixes == (4, 8)
+    assert metrics[-1]["matryoshka_num_prefixes"] == 2.0
+    assert metrics[-1]["matryoshka_loss_coeff"] == 0.5
+    assert "matryoshka_recon_loss_prefix/4" in metrics[-1]
+    assert metrics[-1]["loss"] >= metrics[-1]["recon_loss"]
 
 
 def test_train_sae_supports_l1_reconstruction_loss():

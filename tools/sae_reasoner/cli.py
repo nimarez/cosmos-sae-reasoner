@@ -107,6 +107,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--init-method", choices=["data", "kaiming"], default="data")
     p.add_argument("--init-blend", type=float, default=0.8, help="Data-point init blend p. Used when --init-method=data.")
     p.add_argument("--activation-norm", choices=["sqrt_d", "none"], default="sqrt_d", help="Scale activations so average L2 norm is sqrt(hidden_dim).")
+    p.add_argument(
+        "--matryoshka-prefixes",
+        default="",
+        help=(
+            "Optional comma-separated nested dictionary cutoffs for Matryoshka SAE training. "
+            "Use absolute feature counts or fractions such as 0.125,0.25,0.5. Empty disables it."
+        ),
+    )
+    p.add_argument("--matryoshka-loss-coeff", type=float, default=1.0, help="Coefficient for summed Matryoshka prefix reconstruction losses.")
     p.add_argument("--recon-loss", choices=["mse", "l1", "smooth_l1"], default="mse")
     p.add_argument("--feature-l1-coeff", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=1000)
@@ -510,6 +519,8 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
         init_method=args.init_method,
         init_blend=args.init_blend,
         activation_norm=args.activation_norm,
+        matryoshka_prefixes=args.matryoshka_prefixes,
+        matryoshka_loss_coeff=args.matryoshka_loss_coeff,
         recon_loss=args.recon_loss,
         feature_l1_coeff=args.feature_l1_coeff,
         steps=args.steps,
@@ -535,6 +546,8 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
             "init_method": args.init_method,
             "init_blend": args.init_blend,
             "activation_norm": args.activation_norm,
+            "matryoshka_prefixes": args.matryoshka_prefixes,
+            "matryoshka_loss_coeff": args.matryoshka_loss_coeff,
             "token_kinds": args.token_kinds,
             "phases": args.phases,
             "train_splits": args.train_splits,
@@ -586,6 +599,8 @@ def init_wandb_run(
         "init_method": args.init_method,
         "init_blend": args.init_blend,
         "activation_norm": args.activation_norm,
+        "matryoshka_prefixes": args.matryoshka_prefixes,
+        "matryoshka_loss_coeff": args.matryoshka_loss_coeff,
         "recon_loss": args.recon_loss,
         "feature_l1_coeff": args.feature_l1_coeff,
         "steps": args.steps,

@@ -21,6 +21,7 @@ class SAEConfig:
     init_blend: float = 0.8
     input_scale: float = 1.0
     batch_topk_momentum: float = 0.01
+    matryoshka_prefixes: tuple[int, ...] = ()
 
     @property
     def feature_dim(self) -> int:
@@ -196,6 +197,8 @@ def train_sae_from_tensor(
     init_blend: float = 0.8,
     activation_norm: str = "sqrt_d",
     batch_topk_momentum: float = 0.01,
+    matryoshka_prefixes: Sequence[int | float | str] | str | None = None,
+    matryoshka_loss_coeff: float = 1.0,
     recon_loss: str = "mse",
     feature_l1_coeff: float = 0.0,
     steps: int = 1000,
@@ -232,6 +235,8 @@ def train_sae_from_tensor(
     if val_acts is not None and val_acts.shape[-1] != acts.shape[-1]:
         raise ValueError(f"validation activations hidden dim {val_acts.shape[-1]} does not match training dim {acts.shape[-1]}")
     input_scale = activation_l2_scale(acts, mode=activation_norm)
+    feature_dim = int(acts.shape[-1]) * int(expansion_factor)
+    resolved_matryoshka_prefixes = resolve_matryoshka_prefixes(matryoshka_prefixes, feature_dim=feature_dim)
     sae = TopKSAE(
         SAEConfig(
             input_dim=acts.shape[-1],
@@ -242,6 +247,7 @@ def train_sae_from_tensor(
             init_blend=init_blend,
             input_scale=input_scale,
             batch_topk_momentum=batch_topk_momentum,
+            matryoshka_prefixes=resolved_matryoshka_prefixes,
         )
     ).to(device)
     if init_method == "data":
@@ -260,8 +266,15 @@ def train_sae_from_tensor(
         batch_group_masks = {label: mask.index_select(0, idx).to(device=device) for label, mask in train_group_masks.items()}
         recon, features, recon_norm, target_norm = sae_training_outputs(sae, batch)
         recon_objective = reconstruction_loss(recon_norm, target_norm, recon_loss)
+        matryoshka_loss, matryoshka_losses_by_prefix = matryoshka_reconstruction_loss(
+            sae,
+            features,
+            target_norm,
+            prefixes=resolved_matryoshka_prefixes,
+            recon_loss=recon_loss,
+        )
         feature_l1 = features.abs().mean()
-        loss = recon_objective + feature_l1_coeff * feature_l1
+        loss = recon_objective + matryoshka_loss_coeff * matryoshka_loss + feature_l1_coeff * feature_l1
         opt.zero_grad(set_to_none=True)
         loss.backward()
         remove_decoder_parallel_grad(sae)
@@ -283,6 +296,9 @@ def train_sae_from_tensor(
                     "step": float(step),
                     "loss": float(loss.item()),
                     "recon_loss": float(recon_objective.item()),
+                    "matryoshka_loss": float(matryoshka_loss.item()),
+                    "matryoshka_loss_coeff": float(matryoshka_loss_coeff),
+                    "matryoshka_num_prefixes": float(len(resolved_matryoshka_prefixes)),
                     "mse": float(mse),
                     "normalized_mse": float(F.mse_loss(recon_norm, target_norm).item()),
                     "explained_variance": float(explained_variance),
@@ -299,6 +315,8 @@ def train_sae_from_tensor(
                     "tokens_seen": float(step * min(batch_size, n)),
                     "elapsed_seconds": float(time.time() - start),
                 }
+                for prefix, prefix_loss in matryoshka_losses_by_prefix.items():
+                    metric[f"matryoshka_recon_loss_prefix/{prefix}"] = float(prefix_loss.item())
                 metric.update(group_reconstruction_metrics(recon, batch, batch_group_masks, prefix="train"))
                 if val_acts is not None:
                     metric.update(
@@ -307,6 +325,7 @@ def train_sae_from_tensor(
                             val_acts,
                             group_masks=val_group_masks,
                             recon_loss=recon_loss,
+                            matryoshka_prefixes=resolved_matryoshka_prefixes,
                             batch_size=val_batch_size or batch_size,
                         )
                     )
@@ -353,6 +372,52 @@ def sae_training_outputs(sae: TopKSAE, batch: torch.Tensor) -> tuple[torch.Tenso
     return recon, features, recon_norm, target_norm
 
 
+def resolve_matryoshka_prefixes(prefixes: Sequence[int | float | str] | str | None, *, feature_dim: int) -> tuple[int, ...]:
+    if prefixes is None or prefixes == "":
+        return ()
+    if feature_dim <= 0:
+        raise ValueError("feature_dim must be positive")
+    if isinstance(prefixes, str):
+        raw_values: Sequence[int | float | str] = [part.strip() for part in prefixes.split(",") if part.strip()]
+    else:
+        raw_values = prefixes
+    resolved: list[int] = []
+    for raw in raw_values:
+        if isinstance(raw, str):
+            value = float(raw)
+            is_fraction = ("." in raw or "e" in raw.lower()) and 0.0 < value <= 1.0
+        else:
+            value = float(raw)
+            is_fraction = isinstance(raw, float) and 0.0 < value <= 1.0
+        if value <= 0:
+            raise ValueError("matryoshka prefixes must be positive")
+        prefix = int(round(value * feature_dim)) if is_fraction else int(value)
+        if prefix <= 0 or prefix > feature_dim:
+            raise ValueError(f"matryoshka prefix {raw!r} resolves to {prefix}, outside [1, {feature_dim}]")
+        resolved.append(prefix)
+    return tuple(sorted(set(resolved)))
+
+
+def matryoshka_reconstruction_loss(
+    sae: TopKSAE,
+    features: torch.Tensor,
+    target_norm: torch.Tensor,
+    *,
+    prefixes: Sequence[int],
+    recon_loss: str,
+) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+    losses: dict[int, torch.Tensor] = {}
+    feature_dim = int(sae.config.feature_dim)
+    for prefix in prefixes:
+        if prefix >= feature_dim:
+            continue
+        prefix_recon = F.linear(features[:, :prefix], sae.decoder.weight[:, :prefix], sae.post_bias)
+        losses[int(prefix)] = reconstruction_loss(prefix_recon, target_norm, recon_loss)
+    if not losses:
+        return target_norm.new_zeros(()), {}
+    return sum(losses.values(), target_norm.new_zeros(())), losses
+
+
 @torch.no_grad()
 def validation_metrics(
     sae: TopKSAE,
@@ -361,6 +426,7 @@ def validation_metrics(
     group_masks: dict[str, torch.Tensor] | None = None,
     recon_loss: str,
     batch_size: int,
+    matryoshka_prefixes: Sequence[int] = (),
 ) -> dict[str, float]:
     n = validation_activations.shape[0]
     if n <= 0:
@@ -376,12 +442,20 @@ def validation_metrics(
         sampled_group_masks = {label: mask.to(device=device) for label, mask in (group_masks or {}).items()}
     recon, features, recon_norm, target_norm = sae_training_outputs(sae, batch)
     val_recon = reconstruction_loss(recon_norm, target_norm, recon_loss)
+    val_matryoshka, val_matryoshka_by_prefix = matryoshka_reconstruction_loss(
+        sae,
+        features,
+        target_norm,
+        prefixes=matryoshka_prefixes,
+        recon_loss=recon_loss,
+    )
     val_mse = F.mse_loss(recon, batch)
     residual_ss = (recon - batch).pow(2).sum()
     centered_ss = (batch - batch.mean(dim=0, keepdim=True)).pow(2).sum().clamp_min(1e-12)
     active = features != 0
     metrics = {
         "val_recon_loss": float(val_recon.item()),
+        "val_matryoshka_loss": float(val_matryoshka.item()),
         "val_mse": float(val_mse.item()),
         "val_normalized_mse": float(F.mse_loss(recon_norm, target_norm).item()),
         "val_explained_variance": float(1.0 - (residual_ss / centered_ss).item()),
@@ -391,6 +465,8 @@ def validation_metrics(
         "val_tokens": float(n),
         "val_sample_tokens": float(sample_n),
     }
+    for prefix, prefix_loss in val_matryoshka_by_prefix.items():
+        metrics[f"val_matryoshka_recon_loss_prefix/{prefix}"] = float(prefix_loss.item())
     metrics.update(group_reconstruction_metrics(recon, batch, sampled_group_masks, prefix="val"))
     return metrics
 
