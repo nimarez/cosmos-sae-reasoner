@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import subprocess
+import tempfile
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Iterator, Literal
 
 import torch
@@ -415,15 +418,15 @@ def load_video_frames_with_metadata(path: str, *, max_frames: int | None = None)
     frame_limit = max_frames or int(os.environ.get("COSMOS_SAE_VIDEO_FRAMES", "16"))
     if _video_codec_name(path) == "av1":
         try:
-            return _load_video_frames_with_pyav(path, frame_limit=frame_limit)
-        except RuntimeLoadError as pyav_exc:
+            return _load_video_frames_with_ffmpeg(path, frame_limit=frame_limit, codec="av1")
+        except RuntimeLoadError as ffmpeg_exc:
             try:
-                return _load_video_frames_with_opencv(path, frame_limit=frame_limit)
-            except RuntimeLoadError as opencv_exc:
+                return _load_video_frames_with_pyav(path, frame_limit=frame_limit)
+            except RuntimeLoadError as pyav_exc:
                 raise RuntimeLoadError(
-                    f"could not decode AV1 video file with PyAV or OpenCV: {path}; "
-                    f"pyav={pyav_exc}; opencv={opencv_exc}"
-                ) from opencv_exc
+                    f"could not decode AV1 video file with FFmpeg/libdav1d or PyAV: {path}; "
+                    f"ffmpeg={ffmpeg_exc}; pyav={pyav_exc}"
+                ) from pyav_exc
     try:
         return _load_video_frames_with_opencv(path, frame_limit=frame_limit)
     except RuntimeLoadError as opencv_exc:
@@ -438,6 +441,28 @@ def load_video_frames_with_metadata(path: str, *, max_frames: int | None = None)
 
 def _video_codec_name(path: str) -> str | None:
     try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=nw=1:nk=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[0].lower()
+    except Exception:
+        pass
+    try:
         import av
     except Exception:
         return None
@@ -450,6 +475,118 @@ def _video_codec_name(path: str) -> str | None:
             name = getattr(codec_context, "name", None) or getattr(stream, "codec", None)
             return str(name).lower() if name else None
     except Exception:
+        return None
+
+
+def _load_video_frames_with_ffmpeg(path: str, *, frame_limit: int, codec: str | None = None) -> tuple[Any, Any]:
+    try:
+        import numpy as np
+        from PIL import Image
+        from transformers.video_utils import VideoMetadata
+    except Exception as exc:  # pragma: no cover - optional runtime dependency
+        raise RuntimeLoadError("FFmpeg video fallback requires numpy, pillow, and transformers") from exc
+
+    probe = _video_probe(path)
+    total_frames = probe.get("frames") or 0
+    step = max(1, int(total_frames // frame_limit)) if total_frames > frame_limit else 1
+    select_filter = f"select=not(mod(n\\,{step}))"
+    input_args = ["-fflags", "+discardcorrupt", "-err_detect", "ignore_err", "-hwaccel", "none"]
+    if codec == "av1":
+        input_args += ["-c:v", "libdav1d"]
+    with tempfile.TemporaryDirectory(prefix="cosmos_sae_frames_") as tmp:
+        output_pattern = str(Path(tmp) / "frame_%06d.png")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            *input_args,
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            select_filter,
+            "-frames:v",
+            str(frame_limit),
+            "-vsync",
+            "vfr",
+            output_pattern,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        frame_paths = sorted(Path(tmp).glob("frame_*.png"))
+        if result.returncode != 0 and not frame_paths:
+            stderr = (result.stderr or "").strip().splitlines()
+            raise RuntimeLoadError(f"FFmpeg could not decode frames from video file: {path}: {' | '.join(stderr[:3])}")
+        frames = [np.asarray(Image.open(frame_path).convert("RGB")) for frame_path in frame_paths[:frame_limit]]
+    if not frames:
+        raise RuntimeLoadError(f"FFmpeg decoded zero frames from video file: {path}")
+    sampled_indices = [int(index * step) for index in range(len(frames))]
+    height, width = int(frames[0].shape[0]), int(frames[0].shape[1])
+    metadata = VideoMetadata(
+        total_num_frames=len(frames),
+        fps=probe.get("fps"),
+        width=probe.get("width") or width,
+        height=probe.get("height") or height,
+        duration=probe.get("duration"),
+        video_backend="ffmpeg",
+        frames_indices=sampled_indices,
+    )
+    return np.stack(frames, axis=0), metadata
+
+
+def _video_probe(path: str) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,avg_frame_rate,nb_frames,duration",
+                "-of",
+                "default=nw=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return result
+    if probe.returncode != 0:
+        return result
+    for line in probe.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or value in {"", "N/A"}:
+            continue
+        if key in {"width", "height", "nb_frames"}:
+            try:
+                result["frames" if key == "nb_frames" else key] = int(value)
+            except ValueError:
+                pass
+        elif key == "duration":
+            try:
+                result["duration"] = float(value)
+            except ValueError:
+                pass
+        elif key == "avg_frame_rate":
+            result["fps"] = _parse_frame_rate(value)
+    return result
+
+
+def _parse_frame_rate(value: str) -> float | None:
+    numerator, sep, denominator = value.partition("/")
+    try:
+        if sep:
+            denom = float(denominator)
+            return float(numerator) / denom if denom else None
+        return float(value)
+    except ValueError:
         return None
 
 

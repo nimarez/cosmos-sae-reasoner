@@ -168,27 +168,36 @@ def test_load_video_frames_falls_back_to_pyav(monkeypatch):
     assert metadata.video_backend == "pyav"
 
 
-def test_load_video_frames_uses_pyav_first_for_av1(monkeypatch):
+def test_load_video_frames_uses_ffmpeg_first_for_av1(monkeypatch):
     from tools.sae_reasoner.runtime import cosmos_hf
 
-    called = {"opencv": False}
+    called = {"opencv": False, "pyav": False, "ffmpeg": False}
 
     def fake_opencv(path, *, frame_limit):
         called["opencv"] = True
         raise AssertionError("OpenCV should not be tried first for AV1")
 
     def fake_pyav(path, *, frame_limit):
+        called["pyav"] = True
+        raise AssertionError("PyAV should not be tried first for AV1")
+
+    def fake_ffmpeg(path, *, frame_limit, codec=None):
+        called["ffmpeg"] = True
+        assert codec == "av1"
         return np.zeros((1, 2, 2, 3), dtype=np.uint8), type(
             "Meta",
             (),
-            {"video_backend": "pyav", "total_num_frames": 1},
+            {"video_backend": "ffmpeg", "total_num_frames": 1},
         )()
 
     monkeypatch.setattr(cosmos_hf, "_video_codec_name", lambda path: "av1")
     monkeypatch.setattr(cosmos_hf, "_load_video_frames_with_opencv", fake_opencv)
     monkeypatch.setattr(cosmos_hf, "_load_video_frames_with_pyav", fake_pyav)
+    monkeypatch.setattr(cosmos_hf, "_load_video_frames_with_ffmpeg", fake_ffmpeg)
 
     _frames, metadata = cosmos_hf.load_video_frames_with_metadata("av1.mp4", max_frames=1)
 
-    assert metadata.video_backend == "pyav"
+    assert metadata.video_backend == "ffmpeg"
+    assert called["ffmpeg"] is True
     assert called["opencv"] is False
+    assert called["pyav"] is False
