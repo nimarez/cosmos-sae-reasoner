@@ -413,6 +413,17 @@ def load_video_frames(path: str, *, max_frames: int | None = None) -> Any:
 
 def load_video_frames_with_metadata(path: str, *, max_frames: int | None = None) -> tuple[Any, Any]:
     frame_limit = max_frames or int(os.environ.get("COSMOS_SAE_VIDEO_FRAMES", "16"))
+    if _video_codec_name(path) == "av1":
+        try:
+            return _load_video_frames_with_pyav(path, frame_limit=frame_limit)
+        except RuntimeLoadError as pyav_exc:
+            try:
+                return _load_video_frames_with_opencv(path, frame_limit=frame_limit)
+            except RuntimeLoadError as opencv_exc:
+                raise RuntimeLoadError(
+                    f"could not decode AV1 video file with PyAV or OpenCV: {path}; "
+                    f"pyav={pyav_exc}; opencv={opencv_exc}"
+                ) from opencv_exc
     try:
         return _load_video_frames_with_opencv(path, frame_limit=frame_limit)
     except RuntimeLoadError as opencv_exc:
@@ -423,6 +434,23 @@ def load_video_frames_with_metadata(path: str, *, max_frames: int | None = None)
                 f"could not decode video file with OpenCV or PyAV: {path}; "
                 f"opencv={opencv_exc}; pyav={pyav_exc}"
             ) from pyav_exc
+
+
+def _video_codec_name(path: str) -> str | None:
+    try:
+        import av
+    except Exception:
+        return None
+    try:
+        with av.open(str(path), mode="r") as container:
+            stream = next((candidate for candidate in container.streams if candidate.type == "video"), None)
+            if stream is None:
+                return None
+            codec_context = getattr(stream, "codec_context", None)
+            name = getattr(codec_context, "name", None) or getattr(stream, "codec", None)
+            return str(name).lower() if name else None
+    except Exception:
+        return None
 
 
 def _load_video_frames_with_opencv(path: str, *, frame_limit: int) -> tuple[Any, Any]:
