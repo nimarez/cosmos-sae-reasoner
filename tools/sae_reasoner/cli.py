@@ -433,7 +433,7 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
         "total_activation_gb": final_total_activation_bytes / 1_000_000_000,
         "metadata_uri": metadata_uri,
     }
-    print(json.dumps(summary, indent=2), flush=True)
+    print(json.dumps(summary), flush=True)
     if wandb_run is not None:
         wandb_run.summary.update(
             {
