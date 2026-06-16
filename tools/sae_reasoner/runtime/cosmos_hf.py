@@ -412,6 +412,20 @@ def load_video_frames(path: str, *, max_frames: int | None = None) -> Any:
 
 
 def load_video_frames_with_metadata(path: str, *, max_frames: int | None = None) -> tuple[Any, Any]:
+    frame_limit = max_frames or int(os.environ.get("COSMOS_SAE_VIDEO_FRAMES", "16"))
+    try:
+        return _load_video_frames_with_opencv(path, frame_limit=frame_limit)
+    except RuntimeLoadError as opencv_exc:
+        try:
+            return _load_video_frames_with_pyav(path, frame_limit=frame_limit)
+        except RuntimeLoadError as pyav_exc:
+            raise RuntimeLoadError(
+                f"could not decode video file with OpenCV or PyAV: {path}; "
+                f"opencv={opencv_exc}; pyav={pyav_exc}"
+            ) from pyav_exc
+
+
+def _load_video_frames_with_opencv(path: str, *, frame_limit: int) -> tuple[Any, Any]:
     try:
         import cv2
         import numpy as np
@@ -419,7 +433,6 @@ def load_video_frames_with_metadata(path: str, *, max_frames: int | None = None)
     except Exception as exc:  # pragma: no cover - optional runtime dependency
         raise RuntimeLoadError("video records require opencv-python-headless for frame decoding") from exc
 
-    frame_limit = max_frames or int(os.environ.get("COSMOS_SAE_VIDEO_FRAMES", "16"))
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise RuntimeLoadError(f"could not open video file: {path}")
@@ -467,6 +480,53 @@ def load_video_frames_with_metadata(path: str, *, max_frames: int | None = None)
         duration=duration,
         video_backend="opencv",
         frames_indices=sampled_indices,
+    )
+    return np.stack(frames, axis=0), metadata
+
+
+def _load_video_frames_with_pyav(path: str, *, frame_limit: int) -> tuple[Any, Any]:
+    try:
+        import av
+        import numpy as np
+        from transformers.video_utils import VideoMetadata
+    except Exception as exc:  # pragma: no cover - optional runtime dependency
+        raise RuntimeLoadError("PyAV video fallback requires av, numpy, and transformers") from exc
+
+    frames = []
+    try:
+        with av.open(str(path), mode="r") as container:
+            stream = next((candidate for candidate in container.streams if candidate.type == "video"), None)
+            if stream is None:
+                raise RuntimeLoadError(f"video file has no video stream: {path}")
+            decoded = [frame.to_rgb().to_ndarray() for frame in container.decode(stream)]
+            total_decoded = len(decoded)
+            if not decoded:
+                raise RuntimeLoadError(f"PyAV decoded zero frames from video file: {path}")
+            if total_decoded > frame_limit:
+                indices = np.linspace(0, total_decoded - 1, frame_limit).round().astype(int).tolist()
+                frames = [decoded[index] for index in indices]
+            else:
+                indices = list(range(total_decoded))
+                frames = decoded
+            fps = float(stream.average_rate) if stream.average_rate else None
+            width = int(stream.codec_context.width or stream.width or frames[0].shape[1])
+            height = int(stream.codec_context.height or stream.height or frames[0].shape[0])
+            duration = None
+            if stream.duration is not None and stream.time_base is not None:
+                duration = float(stream.duration * stream.time_base)
+    except RuntimeLoadError:
+        raise
+    except Exception as exc:
+        raise RuntimeLoadError(f"PyAV could not decode video file: {path}") from exc
+
+    metadata = VideoMetadata(
+        total_num_frames=len(frames),
+        fps=fps,
+        width=width,
+        height=height,
+        duration=duration,
+        video_backend="pyav",
+        frames_indices=[int(index) for index in indices],
     )
     return np.stack(frames, axis=0), metadata
 

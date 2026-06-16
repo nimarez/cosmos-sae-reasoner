@@ -144,3 +144,25 @@ def test_load_video_frames_preserves_metadata(monkeypatch):
     assert metadata.height == 2
     assert metadata.video_backend == "opencv"
     assert metadata.frames_indices == [0, 3]
+
+
+def test_load_video_frames_falls_back_to_pyav(monkeypatch):
+    from tools.sae_reasoner.runtime import cosmos_hf
+
+    def fake_opencv(path, *, frame_limit):
+        raise cosmos_hf.RuntimeLoadError("opencv failed")
+
+    def fake_pyav(path, *, frame_limit):
+        return np.zeros((1, 2, 2, 3), dtype=np.uint8), type(
+            "Meta",
+            (),
+            {"video_backend": "pyav", "total_num_frames": 1},
+        )()
+
+    monkeypatch.setattr(cosmos_hf, "_load_video_frames_with_opencv", fake_opencv)
+    monkeypatch.setattr(cosmos_hf, "_load_video_frames_with_pyav", fake_pyav)
+
+    frames, metadata = cosmos_hf.load_video_frames_with_metadata("av1.mp4", max_frames=1)
+
+    assert frames.shape == (1, 2, 2, 3)
+    assert metadata.video_backend == "pyav"
