@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from .artifacts import iter_jsonl, repo_root, write_jsonl
+from .storage import parse_s3_uri
 
 MediaType = Literal["text", "image", "video"]
 
@@ -70,14 +72,48 @@ class ManifestRecord:
         return obj
 
 
-def load_manifest(path: Path) -> list[ManifestRecord]:
+def load_manifest(path: Path | str) -> list[ManifestRecord]:
     return list(iter_manifest(path))
 
 
-def iter_manifest(path: Path) -> Iterator[ManifestRecord]:
+def iter_manifest(path: Path | str) -> Iterator[ManifestRecord]:
     base = repo_root()
-    for obj in iter_jsonl(path):
+    for obj in iter_manifest_json(path):
         yield ManifestRecord.from_json(obj, base_dir=base)
+
+
+def iter_manifest_json(path: Path | str) -> Iterator[dict[str, Any]]:
+    raw = str(path)
+    parsed = urlparse(raw)
+    if parsed.scheme in {"http", "https"}:
+        for line_no, line in enumerate((line.decode("utf-8") for line in urlopen(raw)), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            obj = __import__("json").loads(line)
+            if not isinstance(obj, dict):
+                raise ValueError(f"{raw}:{line_no}: expected object record")
+            yield obj
+        return
+    if parsed.scheme == "s3":
+        try:
+            import boto3
+        except Exception as exc:  # pragma: no cover - depends on optional env
+            raise RuntimeError("S3 manifest input requires boto3.") from exc
+        bucket, key = parse_s3_uri(raw)
+        endpoint_url = __import__("os").environ.get("AWS_ENDPOINT_URL_S3") or __import__("os").environ.get("AWS_ENDPOINT_URL")
+        kwargs = {"endpoint_url": endpoint_url} if endpoint_url else {}
+        body = boto3.client("s3", **kwargs).get_object(Bucket=bucket, Key=key)["Body"]
+        for line_no, line in enumerate((line.decode("utf-8") for line in body.iter_lines()), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            obj = __import__("json").loads(line)
+            if not isinstance(obj, dict):
+                raise ValueError(f"{raw}:{line_no}: expected object record")
+            yield obj
+        return
+    yield from iter_jsonl(Path(raw))
 
 
 def make_sample_manifest(output: Path) -> list[ManifestRecord]:

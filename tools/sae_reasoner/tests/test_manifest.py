@@ -1,3 +1,5 @@
+import sys
+import types
 from pathlib import Path
 
 from tools.sae_reasoner.manifest import ManifestRecord, load_manifest, make_sample_manifest
@@ -45,3 +47,28 @@ def test_manifest_accepts_remote_media_path():
     assert record.media_path == "hf://dataset/nvidia/example/videos/clip.mp4"
     assert record.metadata == {"source": "hf-files"}
     assert record.to_json()["metadata"] == {"source": "hf-files"}
+
+
+def test_load_manifest_from_s3_uri(monkeypatch):
+    class FakeBody:
+        def iter_lines(self):
+            return iter(
+                [
+                    b'{"id":"remote","media_type":"video","media_path":"s3://bucket/media/clip.mp4","prompt":"describe"}'
+                ]
+            )
+
+    class FakeS3Client:
+        def get_object(self, Bucket, Key):
+            assert Bucket == "bucket"
+            assert Key == "manifests/run.jsonl"
+            return {"Body": FakeBody()}
+
+    fake_boto3 = types.SimpleNamespace(client=lambda *_args, **_kwargs: FakeS3Client())
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    records = load_manifest("s3://bucket/manifests/run.jsonl")
+
+    assert len(records) == 1
+    assert records[0].id == "remote"
+    assert records[0].media_path == "s3://bucket/media/clip.mp4"

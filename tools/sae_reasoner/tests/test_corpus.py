@@ -1,4 +1,5 @@
 import sys
+import tarfile
 import types
 from pathlib import Path
 
@@ -6,8 +7,10 @@ from tools.sae_reasoner.corpus import (
     BuildCorpusConfig,
     build_corpus_manifest,
     build_from_hf_files,
+    build_from_hf_tar_s3,
     build_from_s3_prefix,
     parse_split_ratios,
+    s3_key_for_tar_member,
 )
 
 
@@ -47,6 +50,104 @@ def test_build_from_hf_files_uses_remote_media(monkeypatch):
     assert records[0]["media_path"].startswith("hf://dataset/org/repo/data/a/video/")
     assert records[0]["metadata"]["source"] == "hf-files"
     assert "sae_train" in records[0]["tags"]
+
+
+def test_robotics_recipe_uses_loose_videos(monkeypatch, tmp_path: Path):
+    class FakeHfApi:
+        def list_repo_files(self, repo_id: str, repo_type: str):
+            assert repo_id == "nvidia/BridgeData2-Subset-Synthetic-Captions"
+            assert repo_type == "dataset"
+            return [
+                "README.md",
+                "sft_dataset_bridge/train/videos/episode_000015_clip000.mp4",
+                "sft_dataset_bridge/train/captions/episode_000015_clip000/caption.txt",
+                "sft_dataset_bridge/val/videos_5frames/episode_000015_clip000.mp4",
+            ]
+
+    fake_module = types.SimpleNamespace(HfApi=lambda: FakeHfApi())
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+
+    output = tmp_path / "robotics.jsonl"
+    records = build_corpus_manifest(
+        BuildCorpusConfig(
+            output=output,
+            source="recipe",
+            recipe="robotics-bridge-captions",
+            max_records=10,
+            split_ratios=(("sae_train", 1.0),),
+        )
+    )
+
+    assert len(records) == 1
+    assert records[0]["media_type"] == "video"
+    assert records[0]["media_path"] == (
+        "hf://dataset/nvidia/BridgeData2-Subset-Synthetic-Captions/"
+        "sft_dataset_bridge/train/videos/episode_000015_clip000.mp4"
+    )
+    assert "robotics" in records[0]["tags"]
+
+
+def test_s3_key_for_tar_member_sanitizes_traversal():
+    key = s3_key_for_tar_member("prefix", "org--repo", "data/a/shard-000.tar", "../clips/a b.mp4")
+
+    assert key == "prefix/media/org--repo/shard-000/clips/a%20b.mp4"
+    assert ".." not in key
+
+
+def test_build_from_hf_tar_s3_materializes_members(monkeypatch, tmp_path: Path):
+    tar_path = tmp_path / "shard.tar"
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.write_bytes(b"fake mp4")
+    text_path = tmp_path / "note.txt"
+    text_path.write_text("skip", encoding="utf-8")
+    with tarfile.open(tar_path, "w") as tar:
+        tar.add(clip_path, arcname="videos/clip 1.mp4")
+        tar.add(text_path, arcname="videos/note.txt")
+
+    class FakeHfApi:
+        def list_repo_files(self, repo_id: str, repo_type: str):
+            assert repo_id == "org/repo"
+            assert repo_type == "dataset"
+            return ["README.md", "data/task/source/shard.tar"]
+
+    def fake_download(repo_id: str, repo_type: str, filename: str):
+        assert repo_id == "org/repo"
+        assert repo_type == "dataset"
+        assert filename == "data/task/source/shard.tar"
+        return str(tar_path)
+
+    uploads: list[tuple[str, str, bytes]] = []
+
+    class FakeS3Client:
+        def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None):
+            uploads.append((bucket, key, fileobj.read()))
+
+    fake_hf = types.SimpleNamespace(HfApi=lambda: FakeHfApi(), hf_hub_download=fake_download)
+    fake_boto3 = types.SimpleNamespace(client=lambda *_args, **_kwargs: FakeS3Client())
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    records = build_from_hf_tar_s3(
+        repo_id="org/repo",
+        shard_globs=("data/*/*/*.tar",),
+        member_globs=("*.mp4",),
+        prompt="Describe {stem} from {shard}.",
+        tags=("robotics",),
+        s3_uri="s3://bucket/prefix",
+        max_records=1,
+        max_shards=1,
+        max_shard_gb=1.0,
+        seed=0,
+        split_ratios=(("sae_train", 1.0),),
+        media_type="auto",
+    )
+
+    assert len(records) == 1
+    assert len(uploads) == 1
+    assert uploads[0] == ("bucket", "prefix/media/org--repo/shard/videos/clip%201.mp4", b"fake mp4")
+    assert records[0]["media_path"] == "s3://bucket/prefix/media/org--repo/shard/videos/clip%201.mp4"
+    assert records[0]["metadata"]["source"] == "hf-tar-s3"
+    assert records[0]["metadata"]["member"] == "videos/clip 1.mp4"
 
 
 def test_build_corpus_manifest_from_jsonl(tmp_path: Path):

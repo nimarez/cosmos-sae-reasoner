@@ -43,18 +43,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("build-corpus-manifest", help="stream external corpus metadata into a neutral manifest")
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--source", choices=["recipe", "hf-files", "hf-dataset", "s3-prefix", "jsonl"], default="recipe")
-    p.add_argument("--recipe", default="physicalai-driving")
+    p.add_argument("--source", choices=["recipe", "hf-files", "hf-dataset", "hf-tar-s3", "s3-prefix", "jsonl"], default="recipe")
+    p.add_argument("--recipe", default="robotics-bridge-captions")
     p.add_argument("--hf-repo-id", default=None)
     p.add_argument("--hf-split", default="train")
     p.add_argument("--s3-uri", default=None)
     p.add_argument("--input-uri", default=None)
     p.add_argument("--include-glob", action="append", default=[])
+    p.add_argument("--member-glob", action="append", default=[], help="Tar member glob for --source hf-tar-s3, e.g. '*.mp4'.")
     p.add_argument("--prompt", default=None)
     p.add_argument("--media-type", choices=["auto", "text", "image", "video"], default="auto")
     p.add_argument("--max-records", type=int, default=1000)
+    p.add_argument("--max-shards", type=int, default=1, help="Maximum tar shards to download for --source hf-tar-s3. Use 0 for all matched shards.")
+    p.add_argument("--max-shard-gb", type=float, default=1.0, help="Skip tar shards larger than this for --source hf-tar-s3. Use 0 for no size filter.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--split-ratios", default="sae_train=0.90,feature_labeling=0.05,steering_eval=0.05")
+    p.add_argument("--manifest-s3-uri", default=None, help="Optional S3 URI to upload the generated manifest JSONL.")
     p.add_argument("--id-field", default=None)
     p.add_argument("--text-field", default=None)
     p.add_argument("--prompt-field", default=None)
@@ -71,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("collect-activations", help="collect prefill activations")
     add_model_args(p)
     add_prompt_args(p)
-    p.add_argument("--manifest", type=Path, required=True)
+    p.add_argument("--manifest", required=True)
     p.add_argument("--layer", type=int, required=True)
     p.add_argument(
         "--output-dir",
@@ -197,9 +201,12 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
             s3_uri=args.s3_uri,
             input_uri=args.input_uri,
             include_globs=tuple(args.include_glob),
+            member_globs=tuple(args.member_glob),
             prompt=args.prompt,
             media_type=args.media_type,
             max_records=args.max_records,
+            max_shards=None if args.max_shards == 0 else args.max_shards,
+            max_shard_gb=None if args.max_shard_gb == 0 else args.max_shard_gb,
             seed=args.seed,
             split_ratios=parse_split_ratios(args.split_ratios),
             id_field=args.id_field,
@@ -211,6 +218,9 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
             max_text_chars=args.max_text_chars,
         )
     )
+    manifest_uri = None
+    if args.manifest_s3_uri:
+        manifest_uri = upload_file_to_s3(args.output, args.manifest_s3_uri)
     split_counts: dict[str, int] = {}
     media_counts: dict[str, int] = {}
     for record in records:
@@ -223,6 +233,7 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "output": str(args.output),
+                "manifest_uri": manifest_uri,
                 "num_records": len(records),
                 "split_counts": split_counts,
                 "media_counts": media_counts,
@@ -232,6 +243,25 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def upload_file_to_s3(path: Path, uri: str) -> str:
+    from .storage import parse_s3_uri
+
+    try:
+        import boto3
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeLoadError("S3 manifest upload requires boto3. Install the sae dependency group.") from exc
+    bucket, key = parse_s3_uri(uri)
+    endpoint_url = __import__("os").environ.get("AWS_ENDPOINT_URL_S3") or __import__("os").environ.get("AWS_ENDPOINT_URL")
+    kwargs = {"endpoint_url": endpoint_url} if endpoint_url else {}
+    boto3.client("s3", **kwargs).upload_file(
+        str(path),
+        bucket,
+        key,
+        ExtraArgs={"ContentType": "application/jsonl; charset=utf-8"},
+    )
+    return f"s3://{bucket}/{key}"
 
 
 def cmd_inspect_model(args: argparse.Namespace) -> int:

@@ -26,21 +26,57 @@ The builder writes JSONL manifests with `hf://...` or `s3://...` media paths;
 `collect-activations` downloads only the current record into
 `COSMOS_SAE_MEDIA_CACHE` or `.cache/sae_reasoner/media`.
 
-First-party PhysicalAI recipes:
+First-party robotics recipes:
 
 ```bash
 python -m tools.sae_reasoner build-corpus-manifest \
   --source recipe \
-  --recipe physicalai-vantage \
+  --recipe robotics-bridge-captions \
   --max-records 5000 \
-  --output outputs/sae_reasoner/manifests/physicalai_vantage.jsonl
+  --output outputs/sae_reasoner/manifests/robotics_bridge_captions.jsonl
 
 python -m tools.sae_reasoner build-corpus-manifest \
   --source recipe \
-  --recipe physicalai-driving \
+  --recipe robotics-bridge \
   --max-records 5000 \
-  --output outputs/sae_reasoner/manifests/physicalai_driving.jsonl
+  --output outputs/sae_reasoner/manifests/robotics_bridge.jsonl
+
+python -m tools.sae_reasoner build-corpus-manifest \
+  --source recipe \
+  --recipe robotics-libero \
+  --max-records 1000 \
+  --output outputs/sae_reasoner/manifests/robotics_libero.jsonl
 ```
+
+`physicalai-driving` and `physicalai-vantage` remain available, but the default
+SAE notebook is robotics-focused.
+
+Cosmos RobotSim SDG is tar-sharded on Hugging Face, so use a bounded
+materialization step to extract a small sample of MP4s to S3 and write a normal
+manifest:
+
+```bash
+set -a
+source .env
+set +a
+
+python -m tools.sae_reasoner build-corpus-manifest \
+  --source recipe \
+  --recipe physicalai-robotsim \
+  --s3-uri s3://my-bucket/cosmos/robotsim/run_001 \
+  --manifest-s3-uri s3://my-bucket/cosmos/robotsim/run_001/manifest.jsonl \
+  --max-records 100 \
+  --max-shards 1 \
+  --max-shard-gb 1.0 \
+  --output outputs/sae_reasoner/manifests/robotsim_run_001.jsonl
+```
+
+`--max-shards` is intentionally important: each RobotSim shard can be large, so
+start with `--max-records 10 --max-shards 1 --max-shard-gb 1.0` before scaling
+up. Use `--max-shard-gb 0` only when you are willing to download large shards.
+The generated manifest points at `s3://...` media and can be used directly by
+`collect-activations`; uploaded S3 manifests can also be used as `--manifest
+s3://bucket/key.jsonl`.
 
 Generic HF file repos:
 

@@ -54,8 +54,41 @@ def test_build_corpus_manifest_parser_defaults():
     args = parser.parse_args(["build-corpus-manifest", "--output", "manifest.jsonl"])
 
     assert args.source == "recipe"
-    assert args.recipe == "physicalai-driving"
+    assert args.recipe == "robotics-bridge-captions"
     assert args.split_ratios == "sae_train=0.90,feature_labeling=0.05,steering_eval=0.05"
+
+
+def test_build_corpus_manifest_parser_hf_tar_s3_options():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "build-corpus-manifest",
+            "--source",
+            "hf-tar-s3",
+            "--hf-repo-id",
+            "org/repo",
+            "--s3-uri",
+            "s3://bucket/prefix",
+            "--output",
+            "manifest.jsonl",
+            "--include-glob",
+            "data/*/*.tar",
+            "--member-glob",
+            "*.mp4",
+            "--max-shards",
+            "2",
+            "--max-shard-gb",
+            "0.5",
+            "--manifest-s3-uri",
+            "s3://bucket/manifests/run.jsonl",
+        ]
+    )
+
+    assert args.source == "hf-tar-s3"
+    assert args.member_glob == ["*.mp4"]
+    assert args.max_shards == 2
+    assert args.max_shard_gb == 0.5
+    assert args.manifest_s3_uri == "s3://bucket/manifests/run.jsonl"
 
 
 def test_render_feature_report_parser_defaults():
