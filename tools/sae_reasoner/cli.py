@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--max-examples", type=int, default=None)
     p.add_argument("--resume", action="store_true", help="Skip records whose activation shard and metadata sidecar already exist.")
-    p.add_argument("--phase", choices=["prefill", "decode", "both"], default="both")
+    p.add_argument("--phase", choices=["prefill", "decode", "both"], default="prefill")
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument(
         "--activation-dtype",

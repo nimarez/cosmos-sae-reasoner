@@ -149,7 +149,7 @@ python -m tools.sae_reasoner collect-activations \
   --manifest outputs/sae_reasoner/sample_manifest.jsonl \
   --layer 18 \
   --output-dir outputs/sae_reasoner/activations/sample_l18 \
-  --phase both \
+  --phase prefill \
   --max-new-tokens 128 \
   --activation-dtype bfloat16 \
   --max-examples 8
@@ -165,7 +165,7 @@ python -m tools.sae_reasoner collect-activations \
   --manifest outputs/sae_reasoner/sample_manifest.jsonl \
   --layer 18 \
   --output-dir "$ACTIVATION_URI" \
-  --phase both \
+  --phase prefill \
   --max-new-tokens 128 \
   --activation-dtype bfloat16 \
   --resume \
@@ -224,10 +224,10 @@ python -m tools.sae_reasoner steer \
   --steer-roles user
 ```
 
-`collect-activations` defaults to `--phase both`, so shards include prompt/media
-prefill tokens and generated assistant decode tokens when generation produces
-them. Decode activations are important for steering demos, so use prefill-only
-collection mainly for speed/control runs. Saved shards default to
+`collect-activations` defaults to `--phase prefill`, so shards include the
+prompt/media tokens the model reads, including any pre-existing caption text in
+the manifest prompt. Use `--phase both` only when you explicitly want generated
+assistant decode tokens included as training rows. Saved shards default to
 `--activation-dtype bfloat16` to avoid doubling GPU-to-CPU transfer and S3
 storage; `train-sae` keeps loaded activations in their stored dtype and casts
 sampled mini-batches to float32 for optimization.

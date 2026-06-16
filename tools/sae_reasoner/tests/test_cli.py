@@ -63,7 +63,7 @@ def test_prompt_format_is_chat_only_by_command():
         ]
     )
     assert collect_args.prompt_format == "chat"
-    assert collect_args.phase == "both"
+    assert collect_args.phase == "prefill"
     assert collect_args.max_new_tokens == 128
     assert collect_args.activation_dtype == "bfloat16"
     assert collect_args.resume is False
