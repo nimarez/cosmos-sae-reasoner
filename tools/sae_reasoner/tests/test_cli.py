@@ -3,10 +3,13 @@ from pathlib import Path
 import torch
 
 from tools.sae_reasoner.cli import (
+    activation_record_assigned,
     activation_meta_bytes,
     activation_meta_tokens,
     activation_sidecar_name,
+    activation_worker_metadata_name,
     build_parser,
+    collect_top_feature_records,
     cmd_collect_activations,
     cmd_steer,
     collect_metric,
@@ -17,6 +20,7 @@ from tools.sae_reasoner.cli import (
     shard_name_for_record,
     shard_path_for_record,
 )
+from tools.sae_reasoner.sae import SAEConfig, TopKSAE
 
 
 def test_shard_path_escapes_dataset_style_ids(tmp_path: Path):
@@ -68,12 +72,40 @@ def test_prompt_format_is_chat_only_by_command():
     assert collect_args.max_new_tokens == 128
     assert collect_args.activation_dtype == "bfloat16"
     assert collect_args.resume is False
+    assert collect_args.worker_index == 0
+    assert collect_args.num_workers == 1
     assert collect_args.wandb_project is None
     assert collect_args.wandb_mode is None
     assert steer_args.prompt_format == "chat"
     assert steer_args.manifest is None
     assert steer_args.steer_token_kinds == ""
     assert "--prompt-format" not in parser.format_help()
+
+
+def test_activation_worker_partition_helpers():
+    assert activation_record_assigned(5, worker_index=1, num_workers=4) is True
+    assert activation_record_assigned(5, worker_index=2, num_workers=4) is False
+    assert activation_worker_metadata_name(worker_index=0, num_workers=1) == "metadata.jsonl"
+    assert activation_worker_metadata_name(worker_index=3, num_workers=8) == "metadata/worker_003.jsonl"
+
+
+def test_train_sae_parser_supports_top_feature_wandb_options():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "train-sae",
+            "--activation-dir",
+            "acts",
+            "--output",
+            "sae.pt",
+        ]
+    )
+
+    assert args.feature_report_splits == "feature_labeling"
+    assert args.feature_report_top_n == 20
+    assert args.feature_report_max_features == 128
+    assert args.feature_report_rank == "absolute"
+    assert args.wandb_top_feature_table is True
 
 
 def test_collect_resume_skips_existing_shard_and_sidecar(monkeypatch, tmp_path: Path):
@@ -122,6 +154,68 @@ def test_collect_resume_skips_existing_shard_and_sidecar(monkeypatch, tmp_path: 
     assert '"id": "rec"' in (output_dir / "metadata.jsonl").read_text(encoding="utf-8")
 
 
+def test_collect_fanout_processes_assigned_records_only(monkeypatch, tmp_path: Path):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        "\n".join(
+            [
+                '{"id":"rec0","media_type":"text","prompt":"zero","tags":[],"metadata":{"split":"sae_train"}}',
+                '{"id":"rec1","media_type":"text","prompt":"one","tags":[],"metadata":{"split":"sae_val"}}',
+                '{"id":"rec2","media_type":"text","prompt":"two","tags":[],"metadata":{"split":"sae_train"}}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "acts"
+    seen: list[str] = []
+
+    class FakeRuntime:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def load(self):
+            return self
+
+        def collect_activations(self, record, **_kwargs):
+            seen.append(record.id)
+            hidden = torch.ones(2, 4, dtype=torch.bfloat16)
+            return hidden, {
+                "id": record.id,
+                "num_tokens": 2,
+                "hidden_dim": 4,
+                "activation_dtype": "bfloat16",
+                "metadata": dict(record.metadata),
+            }
+
+    monkeypatch.setattr("tools.sae_reasoner.runtime.CosmosReasonerRuntime", FakeRuntime)
+    args = build_parser().parse_args(
+        [
+            "collect-activations",
+            "--manifest",
+            str(manifest),
+            "--layer",
+            "18",
+            "--output-dir",
+            str(output_dir),
+            "--worker-index",
+            "1",
+            "--num-workers",
+            "2",
+        ]
+    )
+
+    assert cmd_collect_activations(args) == 0
+    assert seen == ["rec1"]
+    assert not (output_dir / shard_name_for_record(0, "rec0")).exists()
+    assert (output_dir / shard_name_for_record(1, "rec1")).exists()
+    assert not (output_dir / shard_name_for_record(2, "rec2")).exists()
+    assert not (output_dir / "metadata.jsonl").exists()
+    worker_metadata = output_dir / "metadata" / "worker_001.jsonl"
+    assert worker_metadata.exists()
+    assert '"id": "rec1"' in worker_metadata.read_text(encoding="utf-8")
+
+
 def test_build_corpus_manifest_parser_defaults():
     parser = build_parser()
     args = parser.parse_args(["build-corpus-manifest", "--output", "manifest.jsonl"])
@@ -154,6 +248,14 @@ def test_build_corpus_manifest_parser_hf_tar_s3_options():
             "0.5",
             "--manifest-s3-uri",
             "s3://bucket/manifests/run.jsonl",
+            "--shard-list",
+            "s3://bucket/manifests/shards.jsonl",
+            "--worker-index",
+            "3",
+            "--num-workers",
+            "8",
+            "--resume",
+            "--stream-tars",
         ]
     )
 
@@ -162,6 +264,11 @@ def test_build_corpus_manifest_parser_hf_tar_s3_options():
     assert args.max_shards == 2
     assert args.max_shard_gb == 0.5
     assert args.manifest_s3_uri == "s3://bucket/manifests/run.jsonl"
+    assert args.shard_list == "s3://bucket/manifests/shards.jsonl"
+    assert args.worker_index == 3
+    assert args.num_workers == 8
+    assert args.resume is True
+    assert args.stream_tars is True
 
 
 def test_render_feature_report_parser_defaults():
@@ -279,8 +386,60 @@ def test_feature_frequency_summary_reports_dead_fraction():
 
     assert summary["dead_features"] == 1
     assert summary["live_features"] == 3
+    assert summary["live_feature_frac"] == 0.75
     assert summary["dead_feature_frac"] == 0.25
+    assert summary["feature_usage_thresholds"]["ge_1"]["count"] == 3
+    assert summary["feature_usage_thresholds"]["ge_2"]["count"] == 3
+    assert summary["feature_usage_thresholds"]["ge_10"]["count"] == 1
+    assert summary["feature_usage_thresholds"]["ge_1e_2"]["frac"] == 0.75
     assert summary["highest_fire_rate_features"][0]["feature_id"] == 3
+
+
+def test_collect_top_feature_records_uses_split_and_topk(tmp_path: Path):
+    shard = tmp_path / "000000_demo.pt"
+    torch.save(
+        {
+            "activations": torch.tensor([[1.0, 0.0], [3.0, 2.0], [2.0, 1.0]]),
+            "meta": {
+                "id": "rec-1",
+                "prompt": "demo prompt",
+                "media_type": "text",
+                "media_path": None,
+                "tags": ["demo"],
+                "metadata": {"split": "feature_labeling"},
+                "token_map": [
+                    {"kind": "text", "phase": "prefill", "role": "user"},
+                    {"kind": "text", "phase": "prefill", "role": "user"},
+                    {"kind": "text", "phase": "decode", "role": "assistant"},
+                ],
+            },
+        },
+        shard,
+    )
+    sae = TopKSAE(SAEConfig(input_dim=2, expansion_factor=2, top_k=4, topk_activation="topk"))
+    with torch.no_grad():
+        sae.encoder.weight.zero_()
+        sae.encoder.bias.zero_()
+        sae.encoder.weight[0, 0] = 1.0
+        sae.encoder.weight[1, 1] = 1.0
+        sae.pre_bias.zero_()
+    records = collect_top_feature_records(
+        activation_dir=tmp_path,
+        sae=sae,
+        feature_ids=[0, 1],
+        top_n=2,
+        feature_rank="absolute",
+        token_kinds=set(),
+        phases=set(),
+        splits={"feature_labeling"},
+    )
+
+    assert len(records) == 4
+    feature0 = [row for row in records if row["feature_id"] == 0]
+    feature1 = [row for row in records if row["feature_id"] == 1]
+    assert [row["token_index"] for row in feature0] == [1, 2]
+    assert [row["token_index"] for row in feature1] == [1, 2]
+    assert all(row["record_id"] == "rec-1" for row in records)
 
 
 def test_steer_parser_supports_manifest_and_token_scope():

@@ -2,9 +2,13 @@ import torch
 
 from tools.sae_reasoner.sae import (
     SAEConfig,
+    ShuffledEpochSampler,
     TopKSAE,
     activation_l2_scale,
+    checkpoint_path,
+    find_latest_checkpoint,
     load_sae,
+    load_training_checkpoint,
     lr_for_step,
     matryoshka_reconstruction_loss,
     reconstruction_loss,
@@ -12,6 +16,24 @@ from tools.sae_reasoner.sae import (
     save_sae,
     train_sae_from_tensor,
 )
+
+
+def _convert_payload_to_legacy_post_bias_format(payload):
+    # Legacy checkpoints used parameter order:
+    # pre_bias, post_bias, encoder.weight, encoder.bias, decoder.weight.
+    payload["state_dict"]["post_bias"] = payload["state_dict"]["pre_bias"].clone()
+    optimizer_state_dict = payload.get("optimizer_state_dict")
+    if optimizer_state_dict is not None:
+        remapped_state = {}
+        for param_id, state in optimizer_state_dict.get("state", {}).items():
+            param_id = int(param_id)
+            remapped_state[param_id if param_id == 0 else param_id + 1] = state
+        remapped_state[1] = {}
+        optimizer_state_dict["state"] = remapped_state
+        for group in optimizer_state_dict.get("param_groups", []):
+            shifted = [int(param_id) if int(param_id) == 0 else int(param_id) + 1 for param_id in group.get("params", [])]
+            group["params"] = [shifted[0], 1, *shifted[1:]] if shifted else [1]
+    return payload
 
 
 def test_topk_sae_shapes_and_sparsity():
@@ -107,6 +129,19 @@ def test_load_legacy_sae_without_topk_activation_uses_relu_topk(tmp_path):
     assert loaded.config.topk_activation == "relu_topk"
 
 
+def test_load_legacy_sae_with_post_bias_still_works(tmp_path):
+    path = tmp_path / "legacy_post_bias.pt"
+    sae = TopKSAE(SAEConfig(input_dim=8, expansion_factor=2, top_k=3))
+    save_sae(str(path), sae)
+    payload = torch.load(path)
+    payload = _convert_payload_to_legacy_post_bias_format(payload)
+    torch.save(payload, path)
+
+    loaded = load_sae(str(path))
+
+    assert torch.allclose(loaded.pre_bias, sae.pre_bias)
+
+
 def test_feature_delta_changes_input_shape():
     sae = TopKSAE(SAEConfig(input_dim=8, expansion_factor=2, top_k=2, input_scale=2.0))
     x = torch.randn(4, 8)
@@ -155,6 +190,7 @@ def test_train_sae_from_tensor_smoke():
         device="cpu",
         log_every=1,
         progress_callback=seen.append,
+        log_diagnostic_histograms=True,
     )
     assert sae.config.input_dim == 8
     assert metrics[-1]["step"] == 3.0
@@ -165,11 +201,20 @@ def test_train_sae_from_tensor_smoke():
     assert "grad_norm" in metrics[-1]
     assert "grad_clipped" in metrics[-1]
     assert "val_recon_loss" in metrics[-1]
+    assert "train_val_gap/recon_loss" in metrics[-1]
+    assert "feature_live_count_batch" in metrics[-1]
+    assert "feature_used_ge_1pct_count_batch" in metrics[-1]
+    assert "decoder_norm_mean" in metrics[-1]
+    assert "decoder_nearest_abs_cosine_sample_max" in metrics[-1]
     assert "train_mse_by_group/kind_text" in metrics[-1]
     assert "val_mse_by_group/kind_video" in metrics[-1]
     assert metrics[-1]["val_tokens"] == 16.0
     assert sae.config.input_scale != 1.0
     assert [row["step"] for row in seen] == [1.0, 2.0, 3.0]
+    assert "_wandb_histograms" not in metrics[-1]
+    assert "hist/feature_fire_rate" in seen[-1]["_wandb_histograms"]
+    assert "hist/val_feature_fire_rate" in seen[-1]["_wandb_histograms"]
+    assert "hist/decoder_norm" in seen[-1]["_wandb_histograms"]
     assert metrics[0]["lr"] < 3e-4
 
 
@@ -193,7 +238,7 @@ def test_matryoshka_reconstruction_loss_uses_decoder_prefixes():
         sae.decoder.weight[:, 0] = torch.tensor([1.0, 0.0])
         sae.decoder.weight[:, 1] = torch.tensor([0.0, 1.0])
         sae.decoder.weight[:, 2] = torch.tensor([1.0, 1.0])
-        sae.post_bias.zero_()
+        sae.pre_bias.zero_()
     features = torch.tensor([[2.0, 3.0, 5.0, 7.0]])
     target = torch.tensor([[2.0, 3.0]])
 
@@ -241,6 +286,164 @@ def test_train_sae_supports_l1_reconstruction_loss():
     )
     assert sae.config.input_dim == 8
     assert metrics[-1]["loss"] >= metrics[-1]["recon_loss"]
+
+
+def _train_kwargs(**overrides):
+    base = dict(expansion_factor=2, top_k=2, batch_size=16, device="cpu", log_every=10)
+    base.update(overrides)
+    return base
+
+
+def test_train_sae_writes_periodic_checkpoints(tmp_path):
+    acts = torch.randn(64, 8)
+    ckpt_dir = tmp_path / "ckpts"
+    train_sae_from_tensor(acts, steps=4, checkpoint_dir=str(ckpt_dir), checkpoint_every=2, **_train_kwargs())
+
+    files = sorted(p.name for p in ckpt_dir.iterdir())
+    assert files == ["checkpoint-000002.pt", "checkpoint-000004.pt"]
+    assert find_latest_checkpoint(str(ckpt_dir)) == str(ckpt_dir / "checkpoint-000004.pt")
+
+    loaded = load_training_checkpoint(checkpoint_path(str(ckpt_dir), 2))
+    assert loaded["step"] == 2
+    assert loaded["optimizer_state_dict"] is not None
+    assert isinstance(loaded["sae"], TopKSAE)
+
+
+def test_train_sae_resume_matches_uninterrupted_run(tmp_path):
+    acts = torch.randn(64, 8)
+
+    torch.manual_seed(0)
+    full_sae, _ = train_sae_from_tensor(acts, steps=4, **_train_kwargs())
+
+    ckpt_dir = tmp_path / "ckpts"
+    torch.manual_seed(0)
+    train_sae_from_tensor(acts, steps=2, checkpoint_dir=str(ckpt_dir), checkpoint_every=2, **_train_kwargs())
+    resumed_sae, _ = train_sae_from_tensor(acts, steps=4, resume_from=str(ckpt_dir), **_train_kwargs())
+
+    assert torch.allclose(full_sae.encoder.weight, resumed_sae.encoder.weight, atol=1e-6)
+    assert torch.allclose(full_sae.decoder.weight, resumed_sae.decoder.weight, atol=1e-6)
+    assert torch.allclose(full_sae.pre_bias, resumed_sae.pre_bias, atol=1e-6)
+
+
+def test_train_sae_can_resume_legacy_post_bias_checkpoint(tmp_path):
+    acts = torch.randn(64, 8)
+
+    torch.manual_seed(0)
+    full_sae, _ = train_sae_from_tensor(acts, steps=4, **_train_kwargs())
+
+    ckpt_dir = tmp_path / "ckpts"
+    torch.manual_seed(0)
+    train_sae_from_tensor(acts, steps=2, checkpoint_dir=str(ckpt_dir), checkpoint_every=2, **_train_kwargs())
+    ckpt_path = checkpoint_path(str(ckpt_dir), 2)
+    payload = torch.load(ckpt_path)
+    payload = _convert_payload_to_legacy_post_bias_format(payload)
+    torch.save(payload, ckpt_path)
+
+    resumed_sae, _ = train_sae_from_tensor(acts, steps=4, resume_from=ckpt_path, **_train_kwargs())
+
+    assert torch.allclose(full_sae.encoder.weight, resumed_sae.encoder.weight, atol=1e-6)
+    assert torch.allclose(full_sae.decoder.weight, resumed_sae.decoder.weight, atol=1e-6)
+    assert torch.allclose(full_sae.pre_bias, resumed_sae.pre_bias, atol=1e-6)
+
+
+def test_resume_rejects_mismatched_config(tmp_path):
+    acts = torch.randn(64, 8)
+    ckpt_dir = tmp_path / "ckpts"
+    train_sae_from_tensor(acts, steps=2, checkpoint_dir=str(ckpt_dir), checkpoint_every=2, **_train_kwargs())
+
+    try:
+        train_sae_from_tensor(acts, steps=4, resume_from=str(ckpt_dir), **_train_kwargs(top_k=4))
+    except ValueError as exc:
+        assert "config" in str(exc)
+    else:
+        raise AssertionError("expected ValueError on mismatched resume config")
+
+
+def test_resume_rejects_non_training_checkpoint(tmp_path):
+    # A save_sae model file ends in .pt but is not a resumable training checkpoint.
+    model_path = tmp_path / "model.pt"
+    sae = TopKSAE(SAEConfig(input_dim=8, expansion_factor=2, top_k=2))
+    save_sae(str(model_path), sae)
+
+    acts = torch.randn(64, 8)
+    try:
+        train_sae_from_tensor(acts, steps=4, resume_from=str(model_path), **_train_kwargs())
+    except ValueError as exc:
+        assert "training checkpoint" in str(exc)
+    else:
+        raise AssertionError("expected ValueError resuming from a save_sae model file")
+
+
+def test_resume_rejects_mismatched_batch_size(tmp_path):
+    acts = torch.randn(64, 8)
+    ckpt_dir = tmp_path / "ckpts"
+    train_sae_from_tensor(acts, steps=2, checkpoint_dir=str(ckpt_dir), checkpoint_every=2, **_train_kwargs(batch_size=16))
+
+    try:
+        train_sae_from_tensor(acts, steps=4, resume_from=str(ckpt_dir), **_train_kwargs(batch_size=8))
+    except ValueError as exc:
+        assert "geometry" in str(exc)
+    else:
+        raise AssertionError("expected ValueError resuming with a different batch_size")
+
+
+def test_resume_rejects_already_finished_run(tmp_path):
+    acts = torch.randn(64, 8)
+    ckpt_dir = tmp_path / "ckpts"
+    train_sae_from_tensor(acts, steps=4, checkpoint_dir=str(ckpt_dir), checkpoint_every=2, **_train_kwargs())
+
+    try:
+        train_sae_from_tensor(acts, steps=4, resume_from=str(ckpt_dir), **_train_kwargs())
+    except ValueError as exc:
+        assert "steps" in str(exc)
+    else:
+        raise AssertionError("expected ValueError resuming a run already at the requested steps")
+
+
+def test_shuffled_epoch_sampler_covers_each_index_once_per_epoch():
+    sampler = ShuffledEpochSampler(10, batch_size=5, seed=0, device=torch.device("cpu"))
+    assert sampler.steps_per_epoch() == 2
+    epoch0 = torch.cat([sampler.next_indices() for _ in range(2)])
+    assert sorted(epoch0.tolist()) == list(range(10))  # without replacement: every index once
+    assert sampler.epoch == 0 and sampler.position == 2
+
+    epoch1 = torch.cat([sampler.next_indices() for _ in range(2)])
+    assert sampler.epoch == 1
+    assert sorted(epoch1.tolist()) == list(range(10))
+    assert not torch.equal(epoch0, epoch1)  # fresh shuffle each epoch
+
+
+def test_shuffled_epoch_sampler_drops_remainder():
+    sampler = ShuffledEpochSampler(10, batch_size=4, seed=1, device=torch.device("cpu"))
+    assert sampler.steps_per_epoch() == 2  # 10 // 4, trailing 2 dropped
+    drawn = torch.cat([sampler.next_indices() for _ in range(2)])
+    assert drawn.numel() == 8
+
+
+def test_shuffled_epoch_sampler_resume_is_deterministic():
+    full = ShuffledEpochSampler(10, batch_size=5, seed=7, device=torch.device("cpu"))
+    full_batches = [full.next_indices() for _ in range(3)]
+
+    a = ShuffledEpochSampler(10, batch_size=5, seed=7, device=torch.device("cpu"))
+    _ = a.next_indices()
+    b = ShuffledEpochSampler(10, batch_size=5, seed=7, device=torch.device("cpu"))
+    b.load_state_dict(a.state_dict())
+    resumed_batches = [b.next_indices() for _ in range(2)]
+
+    assert torch.equal(full_batches[1], resumed_batches[0])
+    assert torch.equal(full_batches[2], resumed_batches[1])
+
+
+def test_train_logs_coverage_and_epoch_metrics():
+    acts = torch.randn(64, 8)
+    _, metrics = train_sae_from_tensor(acts, steps=8, **_train_kwargs(batch_size=16, log_every=1))
+    last = metrics[-1]
+    assert "new_tokens_seen" in last and "data_coverage" in last and "epoch" in last
+    # 8 steps * batch 16 = 128 draws over 64 rows without replacement -> full coverage by epoch 2
+    assert last["new_tokens_seen"] == 64.0
+    assert last["data_coverage"] == 1.0
+    assert last["epoch"] == 2.0
+    assert last["new_tokens_seen"] <= last["tokens_seen"]
 
 
 def test_reconstruction_loss_variants():

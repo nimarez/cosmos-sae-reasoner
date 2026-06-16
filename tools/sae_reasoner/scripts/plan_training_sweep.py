@@ -206,7 +206,13 @@ def render_run(config: SweepConfig, args: argparse.Namespace) -> list[str]:
         "sae_train,sae_val",
         "--batch-size",
         str(args.analysis_batch_size),
+        "--wandb-run-name",
+        f"{config.run_id}_analysis",
+        "--wandb-tags",
+        f"{args.wandb_tags},{config.stage},analysis",
     ]
+    if args.wandb_project:
+        analyze.extend(["--wandb-project", args.wandb_project])
     return [
         f"echo {shlex.quote('start ' + config.run_id)}",
         " ".join(shlex.quote(part) for part in train),

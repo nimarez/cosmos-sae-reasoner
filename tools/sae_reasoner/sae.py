@@ -3,11 +3,13 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from math import sqrt
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from .storage import join_uri, list_uri_names, load_torch_uri, save_torch_uri, uri_exists
 
 
 @dataclass(frozen=True)
@@ -35,7 +37,6 @@ class TopKSAE(nn.Module):
         self.encoder = nn.Linear(config.input_dim, config.feature_dim)
         self.decoder = nn.Linear(config.feature_dim, config.input_dim, bias=False)
         self.pre_bias = nn.Parameter(torch.zeros(config.input_dim))
-        self.post_bias = nn.Parameter(torch.zeros(config.input_dim))
         self.register_buffer("batch_topk_threshold", torch.tensor(0.0))
         nn.init.kaiming_uniform_(self.encoder.weight, a=5**0.5)
         self._init_encoder_bias()
@@ -87,7 +88,6 @@ class TopKSAE(nn.Module):
         self.decoder.weight.copy_(self.encoder.weight.T)
         self._init_encoder_bias()
         nn.init.zeros_(self.pre_bias)
-        nn.init.zeros_(self.post_bias)
         self._renorm_decoder()
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -135,7 +135,7 @@ class TopKSAE(nn.Module):
         return selected
 
     def decode(self, features: torch.Tensor, *, unscale: bool = True) -> torch.Tensor:
-        recon = self.decoder(features) + self.post_bias
+        recon = self.decoder(features) + self.pre_bias
         return self.unscale_output(recon) if unscale else recon
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -159,33 +159,246 @@ class TopKSAE(nn.Module):
         return self.unscale_output(delta_coeff.unsqueeze(-1) * decoder_vector)
 
 
-def save_sae(path: str, sae: TopKSAE, *, metadata: dict | None = None) -> None:
-    torch.save(
+def save_sae(path: str, sae: TopKSAE, *, metadata: dict | None = None) -> str:
+    return save_torch_uri(
+        path,
         {
             "config": sae.config.__dict__,
             "state_dict": sae.state_dict(),
             "metadata": metadata or {},
         },
-        path,
     )
 
 
-def load_sae(path: str, map_location: str | torch.device = "cpu") -> TopKSAE:
-    payload = torch.load(path, map_location=map_location)
+def _sae_from_payload(payload: dict) -> TopKSAE:
     raw_config = dict(payload["config"])
     if "topk_activation" not in raw_config:
         raw_config["topk_activation"] = "relu_topk"
     config = SAEConfig(**raw_config)
     sae = TopKSAE(config)
-    load_result = sae.load_state_dict(payload["state_dict"], strict=False)
+    state_dict = _compatible_sae_state_dict(payload.get("state_dict", {}))
+    load_result = sae.load_state_dict(state_dict, strict=False)
     tolerated_missing = {"batch_topk_threshold"}
     missing = set(load_result.missing_keys) - tolerated_missing
     if missing or load_result.unexpected_keys:
         raise RuntimeError(
             f"invalid SAE checkpoint state_dict; missing={sorted(missing)} unexpected={sorted(load_result.unexpected_keys)}"
         )
+    return sae
+
+
+def _compatible_sae_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Map legacy SAE checkpoints with a separate post_bias onto the tied-bias model."""
+    compatible = dict(state_dict)
+    if "post_bias" in compatible:
+        compatible.pop("post_bias")
+    return compatible
+
+
+def _compatible_optimizer_state_dict(optimizer_state_dict: dict[str, Any] | None, *, state_dict: dict[str, Any]) -> dict[str, Any] | None:
+    """Map legacy optimizer ids from the two-bias model onto the tied-bias model.
+
+    Legacy checkpoints used parameter order:
+    pre_bias, post_bias, encoder.weight, encoder.bias, decoder.weight
+
+    Current checkpoints use:
+    pre_bias, encoder.weight, encoder.bias, decoder.weight
+    """
+    if optimizer_state_dict is None or "post_bias" not in state_dict:
+        return optimizer_state_dict
+    groups = optimizer_state_dict.get("param_groups") or []
+    compatible_state = {
+        (int(param_id) - 1 if int(param_id) > 1 else int(param_id)): value
+        for param_id, value in (optimizer_state_dict.get("state") or {}).items()
+        if int(param_id) != 1
+    }
+    remapped_groups = []
+    for group in groups:
+        remapped_group = dict(group)
+        remapped_group["params"] = [
+            (int(param_id) - 1 if int(param_id) > 1 else int(param_id))
+            for param_id in group.get("params", [])
+            if int(param_id) != 1
+        ]
+        remapped_groups.append(remapped_group)
+    return {
+        **optimizer_state_dict,
+        "state": compatible_state,
+        "param_groups": remapped_groups,
+    }
+
+
+def load_sae(path: str, map_location: str | torch.device = "cpu") -> TopKSAE:
+    payload = load_torch_uri(path, map_location=str(map_location))
+    sae = _sae_from_payload(payload)
     sae.eval()
     return sae
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {"cpu": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+    cpu_state = state.get("cpu")
+    if cpu_state is not None:
+        torch.set_rng_state(cpu_state.cpu())
+    cuda_state = state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() for s in cuda_state])
+
+
+_CHECKPOINT_PREFIX = "checkpoint-"
+_CHECKPOINT_SUFFIX = ".pt"
+
+
+def checkpoint_path(checkpoint_dir: str, step: int) -> str:
+    """Local path or S3 URI for a given training step's checkpoint."""
+    return join_uri(checkpoint_dir, f"{_CHECKPOINT_PREFIX}{int(step):06d}{_CHECKPOINT_SUFFIX}")
+
+
+def save_training_checkpoint(
+    path: str,
+    *,
+    sae: TopKSAE,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    metrics: list[dict[str, float]],
+    rng_state: dict[str, Any] | None = None,
+    sampler_state: dict[str, Any] | None = None,
+    metadata: dict | None = None,
+) -> str:
+    """Write a resumable training checkpoint (model + optimizer + step + RNG + sampler) locally or to S3."""
+    payload = {
+        "format": "sae_training_checkpoint",
+        "config": sae.config.__dict__,
+        "state_dict": sae.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "step": int(step),
+        "metrics": metrics,
+        "rng_state": rng_state if rng_state is not None else _capture_rng_state(),
+        "sampler_state": sampler_state or {},
+        "metadata": metadata or {},
+    }
+    return save_torch_uri(path, payload)
+
+
+def load_training_checkpoint(path: str, map_location: str | torch.device = "cpu") -> dict[str, Any]:
+    """Load a training checkpoint, returning the rebuilt SAE plus optimizer/step/metrics/RNG state."""
+    payload = load_torch_uri(path, map_location=str(map_location))
+    if payload.get("format") != "sae_training_checkpoint":
+        raise ValueError(
+            f"{path!r} is not a resumable training checkpoint "
+            "(missing format='sae_training_checkpoint'); a save_sae model file cannot be resumed from"
+        )
+    sae = _sae_from_payload(payload)
+    return {
+        "sae": sae,
+        "config": sae.config,
+        "optimizer_state_dict": _compatible_optimizer_state_dict(
+            payload.get("optimizer_state_dict"),
+            state_dict=payload.get("state_dict", {}),
+        ),
+        "step": int(payload.get("step", 0)),
+        "metrics": list(payload.get("metrics", [])),
+        "rng_state": payload.get("rng_state", {}),
+        "sampler_state": payload.get("sampler_state", {}),
+        "metadata": payload.get("metadata", {}),
+    }
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
+    """Return the highest-step checkpoint URI in a local dir or S3 prefix, or None if there are none."""
+    best_step = -1
+    best_name: str | None = None
+    for name in list_uri_names(checkpoint_dir, prefix=_CHECKPOINT_PREFIX, suffix=_CHECKPOINT_SUFFIX):
+        stem = name[len(_CHECKPOINT_PREFIX) : -len(_CHECKPOINT_SUFFIX)]
+        if not stem.isdigit():
+            continue
+        step = int(stem)
+        if step > best_step:
+            best_step = step
+            best_name = name
+    return join_uri(checkpoint_dir, best_name) if best_name is not None else None
+
+
+def _resolve_resume_checkpoint(resume_from: str) -> str:
+    # A path/URI ending in the checkpoint suffix is a single checkpoint file; anything
+    # else is treated as a directory/prefix to scan for the latest checkpoint.
+    if resume_from.endswith(_CHECKPOINT_SUFFIX):
+        if not uri_exists(resume_from):
+            raise FileNotFoundError(f"resume checkpoint {resume_from!r} does not exist")
+        return resume_from
+    latest = find_latest_checkpoint(resume_from)
+    if latest is None:
+        raise FileNotFoundError(f"no {_CHECKPOINT_PREFIX}*{_CHECKPOINT_SUFFIX} found under resume target {resume_from!r}")
+    return latest
+
+
+class ShuffledEpochSampler:
+    """Without-replacement mini-batch sampler: each epoch draws a fresh shuffled permutation.
+
+    Batch order is fully determined by ``seed`` and the integer epoch, so resuming only needs
+    ``(seed, epoch, position)`` — no RNG blob. The trailing ``n % batch_size`` indices of each
+    epoch's permutation are dropped (drop_last) to keep a constant batch size; a different tail
+    is dropped each epoch because the permutation is reshuffled.
+    """
+
+    def __init__(self, n: int, batch_size: int, *, seed: int, device: torch.device):
+        if n <= 0:
+            raise ValueError("ShuffledEpochSampler requires n > 0")
+        self.n = int(n)
+        self.batch_size = max(1, min(int(batch_size), self.n))
+        self.seed = int(seed)
+        self.device = device
+        self.epoch = 0
+        self.position = 0
+        self._perm = self._make_perm(self.epoch)
+
+    def steps_per_epoch(self) -> int:
+        return max(1, self.n // self.batch_size)
+
+    def _make_perm(self, epoch: int) -> torch.Tensor:
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(self.seed + int(epoch))
+        return torch.randperm(self.n, generator=gen, device=self.device)
+
+    def next_indices(self) -> torch.Tensor:
+        if self.position >= self.steps_per_epoch():
+            self.epoch += 1
+            self.position = 0
+            self._perm = self._make_perm(self.epoch)
+        start = self.position * self.batch_size
+        idx = self._perm[start : start + self.batch_size]
+        self.position += 1
+        return idx
+
+    def fractional_epoch(self) -> float:
+        return self.epoch + self.position / self.steps_per_epoch()
+
+    def state_dict(self) -> dict[str, int]:
+        return {"seed": self.seed, "epoch": self.epoch, "position": self.position, "n": self.n, "batch_size": self.batch_size}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        # Batch ordering is only reproducible when data/batch geometry matches; refuse to resume
+        # silently against a different shape, which would desync coverage and re-traverse data.
+        saved_n = int(state.get("n", -1))
+        saved_batch_size = int(state.get("batch_size", -1))
+        if saved_n != self.n or saved_batch_size != self.batch_size:
+            raise ValueError(
+                "cannot resume sampler: checkpoint geometry "
+                f"(n={saved_n}, batch_size={saved_batch_size}) does not match current "
+                f"(n={self.n}, batch_size={self.batch_size})"
+            )
+        self.seed = int(state["seed"])
+        self.epoch = int(state["epoch"])
+        self.position = int(state["position"])
+        self._perm = self._make_perm(self.epoch)
 
 
 def train_sae_from_tensor(
@@ -207,6 +420,7 @@ def train_sae_from_tensor(
     feature_l1_coeff: float = 0.0,
     steps: int = 1000,
     batch_size: int = 1024,
+    shuffle_seed: int = 0,
     lr: float = 3e-4,
     warmup_steps: int = 0,
     lr_schedule: str = "constant",
@@ -214,7 +428,13 @@ def train_sae_from_tensor(
     val_batch_size: int | None = None,
     device: str | torch.device | None = None,
     log_every: int | None = None,
-    progress_callback: Callable[[dict[str, float]], None] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    log_diagnostic_histograms: bool = False,
+    decoder_similarity_sample_size: int = 256,
+    checkpoint_dir: str | None = None,
+    checkpoint_every: int | None = None,
+    resume_from: str | None = None,
+    checkpoint_metadata: dict | None = None,
 ) -> tuple[TopKSAE, list[dict[str, float]]]:
     if activations.ndim != 2:
         raise ValueError(f"activations must be rank-2 [N, D], got shape {tuple(activations.shape)}")
@@ -256,16 +476,47 @@ def train_sae_from_tensor(
     ).to(device)
     if init_method == "data":
         sae.initialize_from_data(acts, blend=init_blend)
-    opt = torch.optim.Adam(sae.parameters(), lr=lr)
+    start_step = 0
     metrics: list[dict[str, float]] = []
+    resumed: dict[str, Any] | None = None
+    if resume_from is not None:
+        resumed = load_training_checkpoint(_resolve_resume_checkpoint(resume_from), map_location=device)
+        if resumed["config"] != sae.config:
+            raise ValueError(
+                "resume checkpoint config does not match the requested training config; "
+                f"checkpoint={resumed['config']} requested={sae.config}"
+            )
+        sae = resumed["sae"].to(device)
+        start_step = resumed["step"]
+        if start_step >= steps:
+            raise ValueError(
+                f"resume checkpoint is at step {start_step}, which is >= requested steps {steps}; "
+                "increase --steps to continue training"
+            )
+        metrics = list(resumed["metrics"])
+    opt = torch.optim.Adam(sae.parameters(), lr=lr)
+    if resumed is not None:
+        if resumed["optimizer_state_dict"] is not None:
+            opt.load_state_dict(resumed["optimizer_state_dict"])
+        _restore_rng_state(resumed["rng_state"])
     n = acts.shape[0]
+    sampler = ShuffledEpochSampler(n, batch_size, seed=shuffle_seed, device=acts.device)
+    seen_mask = torch.zeros(n, dtype=torch.bool, device=acts.device)
+    if resumed is not None:
+        sampler_state = resumed["sampler_state"]
+        if sampler_state.get("sampler"):
+            sampler.load_state_dict(sampler_state["sampler"])
+        resumed_seen = sampler_state.get("seen_mask")
+        if resumed_seen is not None and resumed_seen.numel() == n:
+            seen_mask = resumed_seen.to(device=acts.device, dtype=torch.bool)
     log_interval = max(1, int(log_every or max(1, steps // 10)))
     start = time.time()
-    for step in range(1, steps + 1):
+    for step in range(start_step + 1, steps + 1):
         step_lr = lr_for_step(lr, step=step, total_steps=steps, warmup_steps=warmup_steps, schedule=lr_schedule)
         for group in opt.param_groups:
             group["lr"] = step_lr
-        idx = torch.randint(0, n, (min(batch_size, n),), device=acts.device)
+        idx = sampler.next_indices()
+        seen_mask[idx] = True
         batch = acts.index_select(0, idx).to(device=device, dtype=torch.float32)
         batch_group_masks = {label: mask.index_select(0, idx).to(device=device) for label, mask in train_group_masks.items()}
         recon, features, recon_norm, target_norm = sae_training_outputs(sae, batch)
@@ -290,8 +541,16 @@ def train_sae_from_tensor(
         sae._renorm_decoder()
         if step == 1 or step == steps or step % log_interval == 0:
             with torch.no_grad():
-                active = features != 0
-                l0 = active.float().sum(dim=-1).mean().item()
+                usage_metrics, histogram_payload = feature_usage_diagnostics(
+                    features,
+                    include_histograms=log_diagnostic_histograms,
+                )
+                decoder_metrics, decoder_histograms = decoder_diagnostics(
+                    sae,
+                    include_histograms=log_diagnostic_histograms,
+                    similarity_sample_size=decoder_similarity_sample_size,
+                )
+                histogram_payload.update(decoder_histograms)
                 mse = F.mse_loss(recon, batch).item()
                 residual_ss = (recon - batch).pow(2).sum()
                 centered_ss = (batch - batch.mean(dim=0, keepdim=True)).pow(2).sum().clamp_min(1e-12)
@@ -307,35 +566,51 @@ def train_sae_from_tensor(
                     "normalized_mse": float(F.mse_loss(recon_norm, target_norm).item()),
                     "explained_variance": float(explained_variance),
                     "feature_l1": float(feature_l1.item()),
-                    "positive_feature_frac": float((features > 0).float().mean().item()),
-                    "l0": float(l0),
-                    "feature_density": float(active.float().mean().item()),
-                    "dead_feature_frac_batch": float((active.sum(dim=0) == 0).float().mean().item()),
                     "grad_norm": float(grad_norm),
                     "grad_clipped": float(did_clip),
                     "lr": float(step_lr),
                     "activation_norm": 1.0 if activation_norm == "sqrt_d" else 0.0,
                     "input_scale": float(input_scale),
-                    "tokens_seen": float(step * min(batch_size, n)),
+                    "tokens_seen": float(step * sampler.batch_size),
+                    "epoch": float(sampler.fractional_epoch()),
+                    "new_tokens_seen": float(int(seen_mask.sum().item())),
+                    "data_coverage": float(seen_mask.float().mean().item()) if n else 0.0,
                     "elapsed_seconds": float(time.time() - start),
                 }
+                metric.update(usage_metrics)
+                metric.update(decoder_metrics)
                 for prefix, prefix_loss in matryoshka_losses_by_prefix.items():
                     metric[f"matryoshka_recon_loss_prefix/{prefix}"] = float(prefix_loss.item())
                 metric.update(group_reconstruction_metrics(recon, batch, batch_group_masks, prefix="train"))
                 if val_acts is not None:
-                    metric.update(
-                        validation_metrics(
-                            sae,
-                            val_acts,
-                            group_masks=val_group_masks,
-                            recon_loss=recon_loss,
-                            matryoshka_prefixes=resolved_matryoshka_prefixes,
-                            batch_size=val_batch_size or batch_size,
-                        )
+                    val_metric = validation_metrics(
+                        sae,
+                        val_acts,
+                        group_masks=val_group_masks,
+                        recon_loss=recon_loss,
+                        matryoshka_prefixes=resolved_matryoshka_prefixes,
+                        batch_size=val_batch_size or batch_size,
+                        include_histograms=log_diagnostic_histograms,
                     )
+                    histogram_payload.update(val_metric.pop("_wandb_histograms", {}))
+                    metric.update(val_metric)
+                    metric.update(train_val_gap_metrics(metric))
                 metrics.append(metric)
                 if progress_callback is not None:
-                    progress_callback(metric)
+                    callback_metric: dict[str, Any] = dict(metric)
+                    if histogram_payload:
+                        callback_metric["_wandb_histograms"] = histogram_payload
+                    progress_callback(callback_metric)
+        if checkpoint_dir and checkpoint_every and (step % checkpoint_every == 0 or step == steps):
+            save_training_checkpoint(
+                checkpoint_path(checkpoint_dir, step),
+                sae=sae,
+                optimizer=opt,
+                step=step,
+                metrics=metrics,
+                sampler_state={"seen_mask": seen_mask.detach().cpu(), "sampler": sampler.state_dict()},
+                metadata=checkpoint_metadata,
+            )
     return sae.cpu(), metrics
 
 
@@ -415,11 +690,172 @@ def matryoshka_reconstruction_loss(
     for prefix in prefixes:
         if prefix >= feature_dim:
             continue
-        prefix_recon = F.linear(features[:, :prefix], sae.decoder.weight[:, :prefix], sae.post_bias)
+        prefix_recon = F.linear(features[:, :prefix], sae.decoder.weight[:, :prefix], sae.pre_bias)
         losses[int(prefix)] = reconstruction_loss(prefix_recon, target_norm, recon_loss)
     if not losses:
         return target_norm.new_zeros(()), {}
     return sum(losses.values(), target_norm.new_zeros(())), losses
+
+
+@torch.no_grad()
+def feature_usage_diagnostics(
+    features: torch.Tensor,
+    *,
+    prefix: str = "",
+    include_histograms: bool = False,
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+    active = features != 0
+    batch_size = max(1, int(features.shape[0]))
+    feature_dim = max(1, int(features.shape[-1]))
+    fire_counts = active.sum(dim=0).to(dtype=torch.float32)
+    fire_rates = fire_counts / float(batch_size)
+    live = fire_counts > 0
+    active_values = features[active].detach().abs().float()
+    token_l0 = active.sum(dim=-1).to(dtype=torch.float32)
+    often_threshold = max(2.0, 0.01 * float(batch_size))
+    name = metric_name(prefix)
+    metrics = {
+        name("l0"): float(token_l0.mean().item()) if token_l0.numel() else 0.0,
+        name("positive_feature_frac"): float((features > 0).float().mean().item()) if features.numel() else 0.0,
+        name("feature_density"): float(active.float().mean().item()) if active.numel() else 0.0,
+        name("dead_feature_frac_batch"): float((~live).float().mean().item()) if fire_counts.numel() else 0.0,
+        name("feature_live_count_batch"): float(live.sum().item()),
+        name("feature_live_frac_batch"): float(live.float().mean().item()) if live.numel() else 0.0,
+        name("feature_dead_count_batch"): float(feature_dim - int(live.sum().item())),
+        name("feature_used_ge_2_count_batch"): float((fire_counts >= 2).sum().item()),
+        name("feature_used_ge_1pct_count_batch"): float((fire_counts >= often_threshold).sum().item()),
+        name("feature_fire_count_max_batch"): float(fire_counts.max().item()) if fire_counts.numel() else 0.0,
+        name("feature_fire_rate_p50_batch"): tensor_quantile(fire_rates, 0.50),
+        name("feature_fire_rate_p90_batch"): tensor_quantile(fire_rates, 0.90),
+        name("feature_fire_rate_p99_batch"): tensor_quantile(fire_rates, 0.99),
+        name("feature_fire_rate_max_batch"): float(fire_rates.max().item()) if fire_rates.numel() else 0.0,
+        name("feature_abs_activation_active_mean"): tensor_mean(active_values),
+        name("feature_abs_activation_active_p99"): tensor_quantile(active_values, 0.99),
+        name("feature_abs_activation_active_max"): tensor_max(active_values),
+    }
+    histograms: dict[str, torch.Tensor] = {}
+    if include_histograms:
+        histograms[histogram_name(prefix, "feature_fire_rate")] = fire_rates.detach().float().cpu()
+        histograms[histogram_name(prefix, "feature_fire_count")] = fire_counts.detach().float().cpu()
+        histograms[histogram_name(prefix, "token_l0")] = token_l0.detach().float().cpu()
+        if active_values.numel():
+            histograms[histogram_name(prefix, "feature_abs_activation_active")] = active_values.detach().float().cpu()
+    return metrics, histograms
+
+
+@torch.no_grad()
+def decoder_diagnostics(
+    sae: TopKSAE,
+    *,
+    include_histograms: bool = False,
+    similarity_sample_size: int = 256,
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+    weight = sae.decoder.weight.detach().float()
+    norms = weight.norm(dim=0)
+    metrics = {
+        "decoder_norm_mean": tensor_mean(norms),
+        "decoder_norm_std": tensor_std(norms),
+        "decoder_norm_min": tensor_min(norms),
+        "decoder_norm_p50": tensor_quantile(norms, 0.50),
+        "decoder_norm_p90": tensor_quantile(norms, 0.90),
+        "decoder_norm_p99": tensor_quantile(norms, 0.99),
+        "decoder_norm_max": tensor_max(norms),
+    }
+    histograms: dict[str, torch.Tensor] = {}
+    if include_histograms:
+        histograms[histogram_name("", "decoder_norm")] = norms.detach().float().cpu()
+    similarity_metrics, similarity_histograms = decoder_similarity_diagnostics(
+        weight,
+        include_histograms=include_histograms,
+        sample_size=similarity_sample_size,
+    )
+    metrics.update(similarity_metrics)
+    histograms.update(similarity_histograms)
+    return metrics, histograms
+
+
+@torch.no_grad()
+def decoder_similarity_diagnostics(
+    decoder_weight: torch.Tensor,
+    *,
+    include_histograms: bool = False,
+    sample_size: int = 256,
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+    feature_dim = int(decoder_weight.shape[1])
+    sample_n = min(max(0, int(sample_size)), feature_dim)
+    if sample_n <= 1:
+        return {}, {}
+    if sample_n == feature_dim:
+        indexes = torch.arange(feature_dim, device=decoder_weight.device)
+    else:
+        indexes = torch.linspace(0, feature_dim - 1, steps=sample_n, device=decoder_weight.device).round().long()
+    columns = decoder_weight.index_select(1, indexes).T
+    columns = F.normalize(columns, dim=-1, eps=1e-12)
+    abs_cosine = (columns @ columns.T).abs()
+    abs_cosine.fill_diagonal_(0.0)
+    nearest = abs_cosine.max(dim=-1).values
+    metrics = {
+        "decoder_nearest_abs_cosine_sample_mean": tensor_mean(nearest),
+        "decoder_nearest_abs_cosine_sample_p95": tensor_quantile(nearest, 0.95),
+        "decoder_nearest_abs_cosine_sample_p99": tensor_quantile(nearest, 0.99),
+        "decoder_nearest_abs_cosine_sample_max": tensor_max(nearest),
+        "decoder_duplicate_frac_cos_gt_0_90_sample": float((nearest > 0.90).float().mean().item()),
+        "decoder_duplicate_frac_cos_gt_0_95_sample": float((nearest > 0.95).float().mean().item()),
+        "decoder_duplicate_frac_cos_gt_0_99_sample": float((nearest > 0.99).float().mean().item()),
+        "decoder_similarity_sample_size": float(sample_n),
+    }
+    histograms = {}
+    if include_histograms:
+        histograms[histogram_name("", "decoder_nearest_abs_cosine_sample")] = nearest.detach().float().cpu()
+    return metrics, histograms
+
+
+def train_val_gap_metrics(metric: dict[str, float]) -> dict[str, float]:
+    gaps: dict[str, float] = {}
+    for key in ["recon_loss", "mse", "normalized_mse", "explained_variance", "l0", "feature_density", "dead_feature_frac_batch"]:
+        val_key = f"val_{key}"
+        if key in metric and val_key in metric:
+            gaps[f"train_val_gap/{key}"] = float(metric[val_key] - metric[key])
+    return gaps
+
+
+def metric_name(prefix: str) -> Callable[[str], str]:
+    clean = prefix.strip("_")
+    if not clean:
+        return lambda name: name
+    return lambda name: f"{clean}_{name}"
+
+
+def histogram_name(prefix: str, name: str) -> str:
+    clean = prefix.strip("_")
+    return f"hist/{clean}_{name}" if clean else f"hist/{name}"
+
+
+def tensor_mean(values: torch.Tensor) -> float:
+    values = values.detach().float().reshape(-1)
+    return float(values.mean().item()) if values.numel() else 0.0
+
+
+def tensor_std(values: torch.Tensor) -> float:
+    values = values.detach().float().reshape(-1)
+    return float(values.std(unbiased=False).item()) if values.numel() else 0.0
+
+
+def tensor_min(values: torch.Tensor) -> float:
+    values = values.detach().float().reshape(-1)
+    return float(values.min().item()) if values.numel() else 0.0
+
+
+def tensor_max(values: torch.Tensor) -> float:
+    values = values.detach().float().reshape(-1)
+    return float(values.max().item()) if values.numel() else 0.0
+
+
+def tensor_quantile(values: torch.Tensor, q: float) -> float:
+    values = values.detach().float().reshape(-1)
+    if not values.numel():
+        return 0.0
+    return float(torch.quantile(values, float(q)).item())
 
 
 @torch.no_grad()
@@ -431,7 +867,8 @@ def validation_metrics(
     recon_loss: str,
     batch_size: int,
     matryoshka_prefixes: Sequence[int] = (),
-) -> dict[str, float]:
+    include_histograms: bool = False,
+) -> dict[str, Any]:
     n = validation_activations.shape[0]
     if n <= 0:
         return {}
@@ -456,22 +893,26 @@ def validation_metrics(
     val_mse = F.mse_loss(recon, batch)
     residual_ss = (recon - batch).pow(2).sum()
     centered_ss = (batch - batch.mean(dim=0, keepdim=True)).pow(2).sum().clamp_min(1e-12)
-    active = features != 0
+    usage_metrics, histogram_payload = feature_usage_diagnostics(
+        features,
+        prefix="val",
+        include_histograms=include_histograms,
+    )
     metrics = {
         "val_recon_loss": float(val_recon.item()),
         "val_matryoshka_loss": float(val_matryoshka.item()),
         "val_mse": float(val_mse.item()),
         "val_normalized_mse": float(F.mse_loss(recon_norm, target_norm).item()),
         "val_explained_variance": float(1.0 - (residual_ss / centered_ss).item()),
-        "val_l0": float(active.float().sum(dim=-1).mean().item()),
-        "val_positive_feature_frac": float((features > 0).float().mean().item()),
-        "val_dead_feature_frac_batch": float((active.sum(dim=0) == 0).float().mean().item()),
         "val_tokens": float(n),
         "val_sample_tokens": float(sample_n),
     }
+    metrics.update(usage_metrics)
     for prefix, prefix_loss in val_matryoshka_by_prefix.items():
         metrics[f"val_matryoshka_recon_loss_prefix/{prefix}"] = float(prefix_loss.item())
     metrics.update(group_reconstruction_metrics(recon, batch, sampled_group_masks, prefix="val"))
+    if histogram_payload:
+        metrics["_wandb_histograms"] = histogram_payload
     return metrics
 
 

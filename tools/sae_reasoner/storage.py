@@ -142,6 +142,82 @@ def iter_s3_keys(bucket: str, prefix: str, *, suffix: str = "") -> Iterator[str]
                 yield key
 
 
+def is_s3_uri(uri: str | Path) -> bool:
+    return str(uri).startswith("s3://")
+
+
+def join_uri(base: str | Path, name: str) -> str:
+    raw = str(base)
+    if is_s3_uri(raw):
+        return f"{raw.rstrip('/')}/{name}"
+    return str(Path(raw) / name)
+
+
+def save_torch_uri(uri: str | Path, payload: dict) -> str:
+    """Serialize a torch payload to a local path (atomically) or an S3 object."""
+    import torch
+
+    raw = str(uri)
+    if is_s3_uri(raw):
+        bucket, key = parse_s3_uri(raw)
+        body = io.BytesIO()
+        torch.save(payload, body)
+        s3_client().put_object(Bucket=bucket, Key=key, Body=body.getvalue())
+        return raw
+    path = Path(raw)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+    return str(path)
+
+
+def load_torch_uri(uri: str | Path, map_location: str = "cpu") -> dict:
+    import torch
+
+    raw = str(uri)
+    if is_s3_uri(raw):
+        bucket, key = parse_s3_uri(raw)
+        body = s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        return torch.load(io.BytesIO(body), map_location=map_location)
+    return torch.load(raw, map_location=map_location)
+
+
+def list_uri_names(dir_uri: str | Path, *, prefix: str = "", suffix: str = "") -> list[str]:
+    """Immediate child file names under a local directory or S3 'directory' prefix."""
+    raw = str(dir_uri)
+    if is_s3_uri(raw):
+        bucket, key_prefix = parse_s3_uri(raw)
+        base = key_prefix.rstrip("/")
+        names: list[str] = []
+        for key in iter_s3_keys(bucket, base, suffix=suffix):
+            name = key[len(base) :].lstrip("/") if base else key
+            if "/" in name:  # skip nested objects, keep immediate children only
+                continue
+            if name.startswith(prefix):
+                names.append(name)
+        return names
+    path = Path(raw)
+    if not path.is_dir():
+        return []
+    return sorted(p.name for p in path.iterdir() if p.is_file() and p.name.startswith(prefix) and p.name.endswith(suffix))
+
+
+def uri_exists(uri: str | Path) -> bool:
+    raw = str(uri)
+    if is_s3_uri(raw):
+        bucket, key = parse_s3_uri(raw)
+        try:
+            s3_client().head_object(Bucket=bucket, Key=key)
+            return True
+        except Exception as exc:
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+            if str(code) in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            raise
+    return Path(raw).exists()
+
+
 def read_text_uri(uri: str | Path) -> str:
     raw = str(uri)
     if raw.startswith("s3://"):

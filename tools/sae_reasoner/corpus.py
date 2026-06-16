@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from string import Formatter
@@ -15,7 +17,7 @@ from urllib.request import urlopen
 
 from .artifacts import write_jsonl
 from .manifest import MediaType, ManifestRecord
-from .storage import parse_s3_uri
+from .storage import parse_s3_uri, read_text_uri
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm"}
@@ -100,7 +102,7 @@ RECIPES: dict[str, CorpusRecipe] = {
         name="physicalai-robotsim",
         source="hf-tar-s3",
         repo_id="nvidia/PhysicalAI-WorldModel-Synthetic-Embodied-Robot-Scenes",
-        include_globs=("data/*/*/*.tar",),
+        include_globs=("*/*/*.tar", "data/*/*/*.tar"),
         member_globs=("*.mp4",),
         prompt=(
             "Describe the robot simulation clip, including the embodiment, scene objects, robot motion, "
@@ -128,6 +130,11 @@ class BuildCorpusConfig:
     max_records: int = 1000
     max_shards: int | None = 1
     max_shard_gb: float | None = 1.0
+    shard_list_uri: str | None = None
+    worker_index: int = 0
+    num_workers: int = 1
+    resume: bool = False
+    stream_tars: bool = False
     seed: int = 0
     split_ratios: tuple[tuple[str, float], ...] = (("sae_train", 0.85), ("sae_val", 0.10), ("feature_labeling", 0.025), ("steering_eval", 0.025))
     id_field: str | None = None
@@ -170,6 +177,11 @@ def build_corpus_manifest(config: BuildCorpusConfig) -> list[dict[str, Any]]:
                 seed=config.seed,
                 split_ratios=config.split_ratios,
                 media_type=config.media_type,
+                shard_list_uri=config.shard_list_uri,
+                worker_index=config.worker_index,
+                num_workers=config.num_workers,
+                resume=config.resume,
+                stream_tars=config.stream_tars,
             )
         else:
             raise ValueError(f"recipe {recipe.name!r} has unsupported source {recipe.source!r}")
@@ -201,6 +213,11 @@ def build_corpus_manifest(config: BuildCorpusConfig) -> list[dict[str, Any]]:
             seed=config.seed,
             split_ratios=config.split_ratios,
             media_type=config.media_type,
+            shard_list_uri=config.shard_list_uri,
+            worker_index=config.worker_index,
+            num_workers=config.num_workers,
+            resume=config.resume,
+            stream_tars=config.stream_tars,
         )
     elif config.source == "s3-prefix":
         records = build_from_s3_prefix(config)
@@ -329,9 +346,14 @@ def build_from_hf_tar_s3(
     seed: int,
     split_ratios: tuple[tuple[str, float], ...],
     media_type: str,
+    shard_list_uri: str | None = None,
+    worker_index: int = 0,
+    num_workers: int = 1,
+    resume: bool = False,
+    stream_tars: bool = False,
 ) -> list[dict[str, Any]]:
     try:
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("HF tar materialization requires huggingface_hub.") from exc
     try:
@@ -345,64 +367,341 @@ def build_from_hf_tar_s3(
     s3 = boto3.client("s3", **kwargs)
     api = HfApi()
     max_shard_bytes = int(max_shard_gb * 1_000_000_000) if max_shard_gb and max_shard_gb > 0 else None
-    shards = list_hf_tar_shards(api, repo_id=repo_id, shard_globs=shard_globs, max_shard_bytes=max_shard_bytes)
+    shards = (
+        list_hf_tar_shards_from_uri(shard_list_uri, shard_globs=shard_globs, max_shard_bytes=max_shard_bytes)
+        if shard_list_uri
+        else list_hf_tar_shards(api, repo_id=repo_id, shard_globs=shard_globs, max_shard_bytes=max_shard_bytes)
+    )
     rng = random.Random(seed)
     rng.shuffle(shards)
+    shards = partition_shards_for_worker(shards, worker_index=worker_index, num_workers=num_workers)
     if max_shards is not None and max_shards > 0:
         shards = shards[:max_shards]
 
     records: list[dict[str, Any]] = []
     repo_slug = repo_id.replace("/", "--")
     for shard_idx, shard in enumerate(shards):
-        if len(records) >= max_records:
+        if record_limit_reached(len(records), max_records):
             break
-        shard_path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=shard)
-        with tarfile.open(shard_path, mode="r:*") as tar:
-            members = [
-                member
-                for member in tar.getmembers()
-                if member.isfile() and match_any(member.name, member_globs) and infer_media_type(member.name, media_type) != "text"
-            ]
-            rng.shuffle(members)
-            for member in members:
-                if len(records) >= max_records:
+        if stream_tars:
+            shard_records = materialize_hf_tar_stream(
+                hf_hub_url=hf_hub_url,
+                repo_id=repo_id,
+                shard=shard,
+                member_globs=member_globs,
+                prompt=prompt,
+                tags=tags,
+                bucket=bucket,
+                prefix=prefix,
+                repo_slug=repo_slug,
+                s3=s3,
+                max_records=max_records - len(records) if max_records > 0 else 0,
+                seed=seed,
+                split_ratios=split_ratios,
+                media_type=media_type,
+                resume=resume,
+                shard_index=shard_idx,
+                worker_index=worker_index,
+                num_workers=num_workers,
+            )
+            records.extend(shard_records)
+            continue
+        tmp_parent = os.environ.get("COSMOS_SAE_TAR_TMPDIR")
+        if tmp_parent:
+            Path(tmp_parent).mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="sae_hf_tar_", dir=tmp_parent) as download_dir:
+            shard, shard_path = download_hf_tar_shard(hf_hub_download, repo_id=repo_id, shard=shard, local_dir=Path(download_dir))
+            with tarfile.open(shard_path, mode="r:*") as tar:
+                members = [
+                    member
+                    for member in tar.getmembers()
+                    if member.isfile() and match_any(member.name, member_globs) and infer_media_type(member.name, media_type) != "text"
+                ]
+                rng.shuffle(members)
+                for member in members:
+                    if record_limit_reached(len(records), max_records):
+                        break
+                    extracted = tar.extractfile(member)
+                    if extracted is None:
+                        continue
+                    records.append(
+                        materialize_tar_member(
+                            extracted=extracted,
+                            repo_id=repo_id,
+                            shard=shard,
+                            member_name=member.name,
+                            prompt=prompt,
+                            tags=tags,
+                            bucket=bucket,
+                            prefix=prefix,
+                            repo_slug=repo_slug,
+                            s3=s3,
+                            seed=seed,
+                            split_ratios=split_ratios,
+                            media_type=media_type,
+                            resume=resume,
+                            shard_index=shard_idx,
+                            worker_index=worker_index,
+                            num_workers=num_workers,
+                        )
+                    )
+    return records
+
+
+def materialize_hf_tar_stream(
+    *,
+    hf_hub_url: Any,
+    repo_id: str,
+    shard: str,
+    member_globs: tuple[str, ...],
+    prompt: str,
+    tags: tuple[str, ...],
+    bucket: str,
+    prefix: str,
+    repo_slug: str,
+    s3: Any,
+    max_records: int,
+    seed: int,
+    split_ratios: tuple[tuple[str, float], ...],
+    media_type: str,
+    resume: bool,
+    shard_index: int,
+    worker_index: int,
+    num_workers: int,
+) -> list[dict[str, Any]]:
+    try:
+        import requests
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("Streaming HF tar materialization requires requests.") from exc
+
+    response, resolved_shard = open_hf_tar_response(requests, hf_hub_url=hf_hub_url, repo_id=repo_id, shard=shard)
+    records: list[dict[str, Any]] = []
+    with response:
+        response.raw.decode_content = True
+        with tarfile.open(fileobj=response.raw, mode="r|*") as tar:
+            for member in tar:
+                if record_limit_reached(len(records), max_records):
                     break
+                if not member.isfile() or not match_any(member.name, member_globs) or infer_media_type(member.name, media_type) == "text":
+                    continue
                 extracted = tar.extractfile(member)
                 if extracted is None:
                     continue
-                record_id = f"hf-tar:{repo_id}:{shard}:{member.name}"
-                split = split_for_record_id(record_id, seed, split_ratios)
-                key = s3_key_for_tar_member(prefix, repo_slug, shard, member.name)
-                with extracted:
-                    s3.upload_fileobj(
-                        extracted,
-                        bucket,
-                        key,
-                        ExtraArgs={"ContentType": content_type_for_path(member.name)},
-                    )
-                media_path = f"s3://{bucket}/{key}"
-                record_tags = sorted(set(tags + (split,) + tags_from_path(shard) + tags_from_path(member.name)))
-                records.append(
-                    make_manifest_dict(
-                        record_id=record_id,
-                        media_type=infer_media_type(member.name, media_type),
-                        prompt=render_template(prompt, path=member.name, stem=Path(member.name).stem, repo_id=repo_id, shard=shard),
-                        media_path=media_path,
-                        tags=record_tags,
-                        metadata={
-                            "source": "hf-tar-s3",
-                            "repo_id": repo_id,
-                            "shard": shard,
-                            "member": member.name,
-                            "source_uri": f"hf://dataset/{repo_id}/{shard}#{member.name}",
-                            "bucket": bucket,
-                            "key": key,
-                            "split": split,
-                            "shard_index": shard_idx,
-                        },
-                    )
+                record = materialize_tar_member(
+                    extracted=extracted,
+                    repo_id=repo_id,
+                    shard=resolved_shard,
+                    member_name=member.name,
+                    prompt=prompt,
+                    tags=tags,
+                    bucket=bucket,
+                    prefix=prefix,
+                    repo_slug=repo_slug,
+                    s3=s3,
+                    seed=seed,
+                    split_ratios=split_ratios,
+                    media_type=media_type,
+                    resume=resume,
+                    shard_index=shard_index,
+                    worker_index=worker_index,
+                    num_workers=num_workers,
                 )
+                records.append(record)
     return records
+
+
+def materialize_tar_member(
+    *,
+    extracted: Any,
+    repo_id: str,
+    shard: str,
+    member_name: str,
+    prompt: str,
+    tags: tuple[str, ...],
+    bucket: str,
+    prefix: str,
+    repo_slug: str,
+    s3: Any,
+    seed: int,
+    split_ratios: tuple[tuple[str, float], ...],
+    media_type: str,
+    resume: bool,
+    shard_index: int,
+    worker_index: int,
+    num_workers: int,
+) -> dict[str, Any]:
+    record_id = f"hf-tar:{repo_id}:{shard}:{member_name}"
+    split = split_for_record_id(record_id, seed, split_ratios)
+    key = s3_key_for_tar_member(prefix, repo_slug, shard, member_name)
+    uploaded = False
+    skipped_existing = False
+    if resume and s3_object_exists(s3, bucket, key):
+        skipped_existing = True
+        extracted.close()
+    else:
+        with extracted:
+            if is_seekable_fileobj(extracted):
+                s3.upload_fileobj(
+                    extracted,
+                    bucket,
+                    key,
+                    ExtraArgs={"ContentType": content_type_for_path(member_name)},
+                )
+            else:
+                upload_spooled_fileobj(
+                    s3,
+                    extracted,
+                    bucket=bucket,
+                    key=key,
+                    content_type=content_type_for_path(member_name),
+                )
+        uploaded = True
+    media_path = f"s3://{bucket}/{key}"
+    record_tags = sorted(set(tags + (split,) + tags_from_path(shard) + tags_from_path(member_name)))
+    return make_manifest_dict(
+        record_id=record_id,
+        media_type=infer_media_type(member_name, media_type),
+        prompt=render_template(prompt, path=member_name, stem=Path(member_name).stem, repo_id=repo_id, shard=shard),
+        media_path=media_path,
+        tags=record_tags,
+        metadata={
+            "source": "hf-tar-s3",
+            "repo_id": repo_id,
+            "shard": shard,
+            "member": member_name,
+            "source_uri": f"hf://dataset/{repo_id}/{shard}#{member_name}",
+            "bucket": bucket,
+            "key": key,
+            "split": split,
+            "shard_index": shard_index,
+            "worker_index": worker_index,
+            "num_workers": num_workers,
+            "uploaded": uploaded,
+            "skipped_existing": skipped_existing,
+        },
+    )
+
+
+def is_seekable_fileobj(fileobj: Any) -> bool:
+    try:
+        return bool(fileobj.seekable())
+    except Exception:
+        return False
+
+
+def upload_spooled_fileobj(s3: Any, fileobj: Any, *, bucket: str, key: str, content_type: str) -> None:
+    tmp_parent = os.environ.get("COSMOS_SAE_TAR_TMPDIR")
+    if tmp_parent:
+        Path(tmp_parent).mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix="sae_hf_member_", dir=tmp_parent) as tmp:
+        shutil.copyfileobj(fileobj, tmp)
+        tmp.flush()
+        tmp.seek(0)
+        s3.upload_fileobj(tmp, bucket, key, ExtraArgs={"ContentType": content_type})
+
+
+def open_hf_tar_response(requests_module: Any, *, hf_hub_url: Any, repo_id: str, shard: str) -> tuple[Any, str]:
+    for candidate in hf_tar_shard_candidates(shard):
+        url = hf_hub_url(repo_id=repo_id, filename=candidate, repo_type="dataset")
+        headers = hf_auth_headers()
+        response = requests_module.get(url, headers=headers, stream=True, timeout=(30, 300))
+        if response.status_code == 404 and candidate != hf_tar_shard_candidates(shard)[-1]:
+            response.close()
+            continue
+        try:
+            response.raise_for_status()
+        except Exception:
+            response.close()
+            raise
+        return response, candidate
+    raise RuntimeError(f"could not resolve HF tar shard: {shard}")
+
+
+def hf_tar_shard_candidates(shard: str) -> list[str]:
+    if shard.startswith("data/"):
+        return [shard]
+    return [shard, f"data/{shard}"]
+
+
+def hf_auth_headers() -> dict[str, str]:
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def download_hf_tar_shard(hf_hub_download: Any, *, repo_id: str, shard: str, local_dir: Path | None = None) -> tuple[str, str]:
+    kwargs: dict[str, Any] = {"repo_id": repo_id, "repo_type": "dataset", "filename": shard}
+    if local_dir is not None:
+        kwargs["local_dir"] = str(local_dir)
+    try:
+        return shard, hf_hub_download(**kwargs)
+    except Exception as original_exc:
+        if shard.startswith("data/"):
+            raise
+        prefixed_shard = f"data/{shard}"
+        kwargs["filename"] = prefixed_shard
+        try:
+            return prefixed_shard, hf_hub_download(**kwargs)
+        except Exception:
+            raise original_exc
+
+
+def record_limit_reached(count: int, max_records: int) -> bool:
+    return max_records > 0 and count >= max_records
+
+
+def partition_shards_for_worker(shards: list[str], *, worker_index: int, num_workers: int) -> list[str]:
+    validate_worker_partition(worker_index=worker_index, num_workers=num_workers)
+    if num_workers == 1:
+        return shards
+    return [shard for shard in shards if shard_worker_index(shard, num_workers=num_workers) == worker_index]
+
+
+def validate_worker_partition(*, worker_index: int, num_workers: int) -> None:
+    if num_workers < 1:
+        raise ValueError("--num-workers must be at least 1")
+    if worker_index < 0 or worker_index >= num_workers:
+        raise ValueError("--worker-index must be in [0, --num-workers)")
+
+
+def shard_worker_index(shard: str, *, num_workers: int) -> int:
+    digest = hashlib.sha256(shard.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % num_workers
+
+
+def list_hf_tar_shards_from_uri(uri: str, *, shard_globs: tuple[str, ...], max_shard_bytes: int | None) -> list[str]:
+    shards: list[str] = []
+    for line_no, line in enumerate(read_text_uri(uri).splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        if isinstance(obj, str):
+            path = obj
+            size = None
+        elif isinstance(obj, dict):
+            path = str(obj.get("shard_path") or obj.get("path") or obj.get("shard") or obj.get("filename") or "")
+            size = obj.get("tar_bytes") or obj.get("size") or obj.get("bytes")
+        else:
+            raise ValueError(f"{uri}:{line_no}: expected object or string JSONL row")
+        if not path:
+            raise ValueError(f"{uri}:{line_no}: shard row is missing a path")
+        if not path.endswith(".tar") or not match_any(path, shard_globs):
+            continue
+        if max_shard_bytes is not None and size is not None and int(size) > max_shard_bytes:
+            continue
+        shards.append(path)
+    return shards
+
+
+def s3_object_exists(client: Any, bucket: str, key: str) -> bool:
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as exc:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+        if str(code) in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
 
 
 def list_hf_tar_shards(api: Any, *, repo_id: str, shard_globs: tuple[str, ...], max_shard_bytes: int | None) -> list[str]:

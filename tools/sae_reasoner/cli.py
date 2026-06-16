@@ -56,8 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prompt", default=None)
     p.add_argument("--media-type", choices=["auto", "text", "image", "video"], default="auto")
     p.add_argument("--max-records", type=int, default=1000)
-    p.add_argument("--max-shards", type=int, default=1, help="Maximum tar shards to download for --source hf-tar-s3. Use 0 for all matched shards.")
+    p.add_argument("--max-shards", type=int, default=1, help="Maximum tar shards to download for --source hf-tar-s3 after worker partitioning. Use 0 for all assigned shards.")
     p.add_argument("--max-shard-gb", type=float, default=1.0, help="Skip tar shards larger than this for --source hf-tar-s3. Use 0 for no size filter.")
+    p.add_argument("--shard-list", default=None, help="Optional local/S3 JSONL shard list for --source hf-tar-s3. Rows may contain shard_path/path/shard.")
+    p.add_argument("--worker-index", type=int, default=0, help="Zero-based fan-out worker index for hf-tar-s3 shard partitioning.")
+    p.add_argument("--num-workers", type=int, default=1, help="Total fan-out workers for hf-tar-s3 shard partitioning.")
+    p.add_argument("--resume", action="store_true", help="For hf-tar-s3, skip uploading media objects that already exist in S3.")
+    p.add_argument("--stream-tars", action="store_true", help="For hf-tar-s3, stream tar shards from Hugging Face instead of downloading each shard to disk.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--split-ratios", default="sae_train=0.85,sae_val=0.10,feature_labeling=0.025,steering_eval=0.025")
     p.add_argument("--manifest-s3-uri", default=None, help="Optional S3 URI to upload the generated manifest JSONL.")
@@ -86,6 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--max-examples", type=int, default=None)
     p.add_argument("--resume", action="store_true", help="Skip records whose activation shard and metadata sidecar already exist.")
+    p.add_argument("--worker-index", type=int, default=0, help="Zero-based activation collection worker index.")
+    p.add_argument("--num-workers", type=int, default=1, help="Total activation collection workers. Records are assigned by global manifest index modulo this value.")
     p.add_argument("--phase", choices=["prefill", "decode", "both"], default="prefill")
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument(
@@ -120,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--feature-l1-coeff", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--shuffle-seed", type=int, default=0, help="Seed for the without-replacement shuffled-epoch batch sampler.")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup-steps", type=int, default=0)
     p.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant")
@@ -128,8 +136,52 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--phases", default="", help="Optional comma-separated phases to train on. Empty means all.")
     p.add_argument("--train-splits", default="sae_train", help="Comma-separated manifest splits used for training. Empty means all splits.")
     p.add_argument("--val-splits", default="sae_val", help="Comma-separated manifest splits used for reconstruction validation. Empty disables validation.")
+    p.add_argument(
+        "--feature-report-splits",
+        default="feature_labeling",
+        help="Comma-separated manifest splits used for post-train top-activating-example logging. Empty disables it.",
+    )
+    p.add_argument("--feature-report-top-n", type=int, default=20, help="Top activating examples to keep per feature for the post-train feature report.")
+    p.add_argument("--feature-report-max-features", type=int, default=128, help="Maximum number of feature ids to include in the post-train feature report.")
+    p.add_argument("--feature-report-rank", choices=["absolute", "positive"], default="absolute", help="Ranking mode for post-train top-activating examples.")
     p.add_argument("--val-batch-size", type=int, default=None, help="Validation sample size per metric row. Defaults to --batch-size.")
     p.add_argument("--log-every", type=int, default=10, help="Emit training metrics every N steps.")
+    p.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Local directory or S3 prefix (s3://bucket/prefix) for resumable training checkpoints.",
+    )
+    p.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Write a checkpoint every N steps (and at the final step) when >0. Requires --checkpoint-dir.",
+    )
+    p.add_argument(
+        "--resume-from",
+        default=None,
+        help="Resume training from a checkpoint file or a directory/prefix (uses the latest checkpoint found).",
+    )
+    p.add_argument(
+        "--decoder-similarity-sample-size",
+        type=int,
+        default=256,
+        help="Number of decoder columns to sample for duplicate/correlation diagnostics. Use 0 to disable.",
+    )
+    p.add_argument(
+        "--no-wandb-diagnostic-histograms",
+        dest="wandb_diagnostic_histograms",
+        action="store_false",
+        help="Disable W&B histogram logging for SAE diagnostic distributions.",
+    )
+    p.add_argument(
+        "--no-wandb-top-feature-table",
+        dest="wandb_top_feature_table",
+        action="store_false",
+        help="Disable post-train top-activating-example logging to the training W&B run.",
+    )
+    p.set_defaults(wandb_diagnostic_histograms=True)
+    p.set_defaults(wandb_top_feature_table=True)
     add_wandb_args(p)
     p.set_defaults(func=cmd_train_sae)
 
@@ -153,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to analyze. Empty means all.")
     p.add_argument("--phases", default="", help="Optional comma-separated token phases to analyze. Empty means all.")
     p.add_argument("--splits", default="sae_train,sae_val", help="Comma-separated manifest splits to analyze. Empty means all.")
+    add_wandb_args(p)
     p.set_defaults(func=cmd_analyze_sae)
 
     p = sub.add_parser("render-feature-report", help="render feature examples as a standalone HTML report")
@@ -268,6 +321,11 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
             max_records=args.max_records,
             max_shards=None if args.max_shards == 0 else args.max_shards,
             max_shard_gb=None if args.max_shard_gb == 0 else args.max_shard_gb,
+            shard_list_uri=args.shard_list,
+            worker_index=args.worker_index,
+            num_workers=args.num_workers,
+            resume=args.resume,
+            stream_tars=args.stream_tars,
             seed=args.seed,
             split_ratios=parse_split_ratios(args.split_ratios),
             id_field=args.id_field,
@@ -344,6 +402,7 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
     from .runtime import CosmosReasonerRuntime
     from .storage import make_activation_store
 
+    validate_worker_partition(worker_index=args.worker_index, num_workers=args.num_workers)
     store = make_activation_store(args.output_dir)
     wandb_run = init_basic_wandb_run(
         args,
@@ -358,6 +417,8 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
             "output_dir": args.output_dir,
             "max_examples": args.max_examples,
             "resume": args.resume,
+            "worker_index": args.worker_index,
+            "num_workers": args.num_workers,
             "phase": args.phase,
             "max_new_tokens": args.max_new_tokens,
             "activation_dtype": args.activation_dtype,
@@ -376,11 +437,15 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
     total_tokens = 0
     total_activation_bytes = 0
     skipped_examples = 0
+    processed_examples = 0
     for idx, record in enumerate(iter_manifest(args.manifest)):
         if args.max_examples is not None and idx >= args.max_examples:
             break
+        if not activation_record_assigned(idx, worker_index=args.worker_index, num_workers=args.num_workers):
+            continue
         shard_name = shard_name_for_record(idx, record.id)
         sidecar_name = activation_sidecar_name(shard_name)
+        processed_examples += 1
         if args.resume and store.exists(shard_name) and store.exists(sidecar_name):
             sidecar = json.loads(store.read_text(sidecar_name))
             metadata.append(sidecar)
@@ -390,6 +455,8 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
                     {
                         "event": "collect_skip",
                         "record_index": idx,
+                        "worker_index": args.worker_index,
+                        "num_workers": args.num_workers,
                         "skipped_examples": skipped_examples,
                         "record_id": record.id,
                         "shard": shard_name,
@@ -420,7 +487,7 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
         total_tokens += int(meta["num_tokens"])
         total_activation_bytes += activation_bytes
         metric = collect_metric(
-            idx=idx,
+            idx=processed_examples - 1,
             meta=meta,
             activation_bytes=activation_bytes,
             total_tokens=total_tokens,
@@ -428,11 +495,26 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
             elapsed_seconds=elapsed,
             record_seconds=record_seconds,
         )
-        print(json.dumps({"event": "collect_metric", **metric, "collected": record.id, "shard": shard_name, "uri": shard_uri}), flush=True)
+        print(
+            json.dumps(
+                {
+                    "event": "collect_metric",
+                    **metric,
+                    "record_index": idx,
+                    "worker_index": args.worker_index,
+                    "num_workers": args.num_workers,
+                    "collected": record.id,
+                    "shard": shard_name,
+                    "uri": shard_uri,
+                }
+            ),
+            flush=True,
+        )
         if wandb_run is not None:
             wandb_run.log(metric, step=int(metric["collected_examples"]))
     metadata_text = "".join(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n" for record in metadata)
-    metadata_uri = store.write_text("metadata.jsonl", metadata_text)
+    metadata_name = activation_worker_metadata_name(worker_index=args.worker_index, num_workers=args.num_workers)
+    metadata_uri = store.write_text(metadata_name, metadata_text)
     final_total_tokens = sum(activation_meta_tokens(record) for record in metadata)
     final_total_activation_bytes = sum(activation_meta_bytes(record) for record in metadata)
     summary = {
@@ -440,6 +522,8 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
         "examples": len(metadata),
         "new_examples": len(metadata) - skipped_examples,
         "skipped_examples": skipped_examples,
+        "worker_index": args.worker_index,
+        "num_workers": args.num_workers,
         "total_tokens": final_total_tokens,
         "total_activation_gb": final_total_activation_bytes / 1_000_000_000,
         "metadata_uri": metadata_uri,
@@ -451,6 +535,8 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
                 "final_collected_examples": len(metadata),
                 "final_new_examples": len(metadata) - skipped_examples,
                 "final_skipped_examples": skipped_examples,
+                "worker_index": args.worker_index,
+                "num_workers": args.num_workers,
                 "final_total_tokens": final_total_tokens,
                 "final_total_activation_gb": final_total_activation_bytes / 1_000_000_000,
                 "metadata_uri": metadata_uri,
@@ -513,6 +599,9 @@ def activation_dtype_bytes(dtype: str) -> int:
 def cmd_train_sae(args: argparse.Namespace) -> int:
     from .sae import save_sae, train_sae_from_tensor
 
+    if args.checkpoint_every > 0 and not args.checkpoint_dir:
+        raise ValueError("--checkpoint-every requires --checkpoint-dir")
+
     train_data = load_activation_dataset(
         args.activation_dir,
         token_kinds=parse_kind_filter(args.token_kinds),
@@ -543,11 +632,14 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
         val_group_counts=val_data.group_counts if val_data is not None else {},
     )
 
-    def log_progress(metric: dict[str, float]) -> None:
-        record = {"event": "train_metric", **metric}
+    def log_progress(metric: dict[str, Any]) -> None:
+        public_metric = public_metric_payload(metric)
+        record = {"event": "train_metric", **public_metric}
         print(json.dumps(record), flush=True)
         if wandb_run is not None:
-            wandb_run.log(metric, step=int(metric["step"]))
+            wandb_metric = dict(public_metric)
+            add_wandb_histograms(wandb_metric, metric.get("_wandb_histograms", {}))
+            wandb_run.log(wandb_metric, step=int(public_metric["step"]))
 
     sae, metrics = train_sae_from_tensor(
         activations,
@@ -567,6 +659,7 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
         feature_l1_coeff=args.feature_l1_coeff,
         steps=args.steps,
         batch_size=args.batch_size,
+        shuffle_seed=args.shuffle_seed,
         lr=args.lr,
         warmup_steps=args.warmup_steps,
         lr_schedule=args.lr_schedule,
@@ -574,6 +667,11 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
         val_batch_size=args.val_batch_size,
         log_every=args.log_every,
         progress_callback=log_progress,
+        log_diagnostic_histograms=bool(wandb_run is not None and args.wandb_diagnostic_histograms),
+        decoder_similarity_sample_size=args.decoder_similarity_sample_size,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_every=args.checkpoint_every if args.checkpoint_every > 0 else None,
+        resume_from=args.resume_from,
     )
     ensure_dir(args.output.parent)
     save_sae(
@@ -594,17 +692,37 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
             "phases": args.phases,
             "train_splits": args.train_splits,
             "val_splits": args.val_splits,
+            "feature_report_splits": args.feature_report_splits,
+            "feature_report_top_n": args.feature_report_top_n,
+            "feature_report_max_features": args.feature_report_max_features,
+            "feature_report_rank": args.feature_report_rank,
             "val_batch_size": args.val_batch_size,
             "lr": args.lr,
             "warmup_steps": args.warmup_steps,
             "lr_schedule": args.lr_schedule,
             "max_grad_norm": args.max_grad_norm,
+            "decoder_similarity_sample_size": args.decoder_similarity_sample_size,
+            "wandb_diagnostic_histograms": args.wandb_diagnostic_histograms,
+            "wandb_top_feature_table": args.wandb_top_feature_table,
             "wandb": wandb_run_metadata(wandb_run),
             "train_group_counts": train_data.group_counts,
             "val_group_counts": val_data.group_counts if val_data is not None else {},
         },
     )
     write_jsonl(args.output.with_suffix(".metrics.jsonl"), metrics)
+    top_feature_artifacts = maybe_log_top_feature_examples(
+        wandb_run=wandb_run if args.wandb_top_feature_table else None,
+        sae=sae,
+        activation_dir=args.activation_dir,
+        output_root=args.output,
+        splits=parse_kind_filter(args.feature_report_splits),
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        max_features=args.feature_report_max_features,
+        top_n=args.feature_report_top_n,
+        feature_rank=args.feature_report_rank,
+        title=f"Top Activating SAE Features: {args.output.stem}",
+    )
     if wandb_run is not None:
         wandb_run.summary.update(
             {
@@ -614,6 +732,7 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
                 "final_val_explained_variance": metrics[-1].get("val_explained_variance") if metrics else None,
                 "final_grad_norm": metrics[-1].get("grad_norm") if metrics else None,
                 "sae_output": str(args.output),
+                **top_feature_artifacts,
             }
         )
         wandb_run.finish()
@@ -655,8 +774,15 @@ def init_wandb_run(
         "phases": args.phases,
         "train_splits": args.train_splits,
         "val_splits": args.val_splits,
+        "feature_report_splits": args.feature_report_splits,
+        "feature_report_top_n": args.feature_report_top_n,
+        "feature_report_max_features": args.feature_report_max_features,
+        "feature_report_rank": args.feature_report_rank,
         "val_batch_size": args.val_batch_size,
         "log_every": args.log_every,
+        "decoder_similarity_sample_size": args.decoder_similarity_sample_size,
+        "wandb_diagnostic_histograms": args.wandb_diagnostic_histograms,
+        "wandb_top_feature_table": args.wandb_top_feature_table,
         "train_group_counts": train_group_counts or {},
         "val_group_counts": val_group_counts or {},
     }
@@ -696,25 +822,117 @@ def wandb_run_metadata(run: Any | None) -> dict[str, Any] | None:
     }
 
 
-def cmd_find_features(args: argparse.Namespace) -> int:
+def public_metric_payload(metric: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metric.items() if not key.startswith("_")}
+
+
+def add_wandb_histograms(metric: dict[str, Any], histograms: dict[str, Any]) -> None:
+    if not histograms:
+        return
+    import wandb
+
+    for name, values in histograms.items():
+        if values is None:
+            continue
+        if hasattr(values, "detach"):
+            values = values.detach().float().cpu().reshape(-1).numpy()
+        if len(values) == 0:
+            continue
+        metric[name] = wandb.Histogram(values)
+
+
+def maybe_log_top_feature_examples(
+    *,
+    wandb_run: Any | None,
+    sae,
+    activation_dir: str | Path,
+    output_root: Path,
+    splits: set[str],
+    token_kinds: set[str],
+    phases: set[str],
+    max_features: int,
+    top_n: int,
+    feature_rank: str,
+    title: str = "Top Activating SAE Features",
+) -> dict[str, Any]:
+    if wandb_run is None or not splits or max_features <= 0 or top_n <= 0:
+        return {}
+    from .visualize import render_feature_report
+
+    feature_ids = list(range(max(0, int(max_features))))
+    feature_ids = feature_ids[: min(len(feature_ids), int(sae.config.feature_dim))]
+    if not feature_ids:
+        return {}
+    records = collect_top_feature_records(
+        activation_dir=activation_dir,
+        sae=sae,
+        feature_ids=feature_ids,
+        top_n=top_n,
+        feature_rank=feature_rank,
+        token_kinds=token_kinds,
+        phases=phases,
+        splits=splits,
+    )
+    if not records:
+        return {}
+    jsonl_path = output_root.with_suffix(".top_features.jsonl")
+    html_path = output_root.with_suffix(".top_features.html")
+    write_jsonl(jsonl_path, records)
+    render_feature_report(jsonl_path, html_path, title=title)
+    table = top_feature_records_table(records)
+    step = getattr(wandb_run, "step", None)
+    wandb_run.log({"top_activating_examples": table}, step=step)
+    artifact = __import__("wandb").Artifact(f"{output_root.stem}_top_features", type="sae_feature_examples")
+    artifact.add_file(str(jsonl_path))
+    artifact.add_file(str(html_path))
+    wandb_run.log_artifact(artifact)
+    wandb_run.summary.update(
+        {
+            "top_feature_examples_logged": len(records),
+            "top_feature_examples_output": str(jsonl_path),
+            "top_feature_report_output": str(html_path),
+            "top_feature_report_splits": ",".join(sorted(splits)),
+            "top_feature_report_top_n": int(top_n),
+            "top_feature_report_max_features": int(len(feature_ids)),
+        }
+    )
+    return {
+        "top_feature_examples_output": str(jsonl_path),
+        "top_feature_report_output": str(html_path),
+        "top_feature_examples_logged": len(records),
+    }
+
+
+def collect_top_feature_records(
+    *,
+    activation_dir: str | Path,
+    sae,
+    feature_ids: list[int],
+    top_n: int,
+    feature_rank: str,
+    token_kinds: set[str],
+    phases: set[str],
+    splits: set[str],
+) -> list[dict[str, Any]]:
+    import heapq
     import torch
 
-    from .sae import load_sae
     from .storage import iter_activation_payloads
 
-    sae = load_sae(str(args.sae))
-    feature_ids = parse_feature_ids(args.feature_ids, sae.config.feature_dim)
-    token_kinds = parse_kind_filter(args.token_kinds)
-    phases = parse_kind_filter(args.phases)
-    records: list[dict[str, Any]] = []
-    for shard_name, payload in iter_activation_payloads(args.activation_dir):
-        if shard_name == "metadata.pt":
+    device = next(sae.parameters()).device
+    sae.eval()
+    heaps: dict[int, list[tuple[float, int, dict[str, Any]]]] = {feature_id: [] for feature_id in feature_ids}
+    tiebreak = 0
+    for shard_name, payload in iter_activation_payloads(activation_dir):
+        if shard_name == "metadata.pt" or "activations" not in payload:
+            continue
+        meta = payload.get("meta") or {}
+        if splits and activation_split(meta) not in splits:
             continue
         acts = payload["activations"].float()
-        meta = payload.get("meta", {})
         token_map = meta.get("token_map") or []
         with torch.no_grad():
-            features = sae.encode(acts)
+            features = sae.encode(acts.to(device=device, dtype=torch.float32)).detach().cpu()
         eligible = [
             idx
             for idx in range(features.shape[0])
@@ -725,32 +943,111 @@ def cmd_find_features(args: argparse.Namespace) -> int:
         eligible_idx = torch.tensor(eligible, dtype=torch.long)
         for feature_id in feature_ids:
             values = features[eligible_idx, feature_id]
-            scores = values.abs() if args.feature_rank == "absolute" else values
-            top_scores, top_idx = torch.topk(scores, k=min(args.top_n, scores.numel()))
+            scores = values.abs() if feature_rank == "absolute" else values
+            top_scores, top_idx = torch.topk(scores, k=min(top_n, scores.numel()))
             for score, local_token_idx in zip(top_scores.tolist(), top_idx.tolist()):
                 value = float(values[int(local_token_idx)].item())
-                if args.feature_rank == "positive" and value <= 0:
+                if feature_rank == "positive" and value <= 0:
                     continue
                 token_idx = int(eligible_idx[int(local_token_idx)].item())
-                token_info = token_info_for_index(token_map, token_idx)
-                records.append(
-                    {
-                        "feature_id": feature_id,
-                        "activation": value,
-                        "activation_score": float(score),
-                        "token_index": int(token_idx),
-                        "token_info": token_info,
-                        "record_id": meta.get("id"),
-                        "prompt": meta.get("prompt"),
-                        "media_type": meta.get("media_type"),
-                        "media_path": meta.get("media_path"),
-                        "tags": meta.get("tags", []),
-                        "metadata": meta.get("metadata", {}),
-                        "shard": shard_name,
-                    }
-                )
-    records.sort(key=lambda r: r.get("activation_score", abs(float(r.get("activation", 0.0)))), reverse=True)
-    write_jsonl(args.output, records[: max(args.top_n, len(feature_ids) * args.top_n)])
+                row = {
+                    "feature_id": feature_id,
+                    "activation": value,
+                    "activation_score": float(score),
+                    "token_index": int(token_idx),
+                    "token_info": token_info_for_index(token_map, token_idx),
+                    "record_id": meta.get("id"),
+                    "prompt": meta.get("prompt"),
+                    "media_type": meta.get("media_type"),
+                    "media_path": meta.get("media_path"),
+                    "tags": meta.get("tags", []),
+                    "metadata": meta.get("metadata", {}),
+                    "shard": shard_name,
+                }
+                heap = heaps[feature_id]
+                candidate = (float(score), tiebreak, row)
+                tiebreak += 1
+                if len(heap) < top_n:
+                    heapq.heappush(heap, candidate)
+                else:
+                    heapq.heappushpop(heap, candidate)
+    records: list[dict[str, Any]] = []
+    for feature_id in feature_ids:
+        ranked = sorted(heaps.get(feature_id, []), key=lambda item: (item[0], item[1]), reverse=True)
+        records.extend(row for _score, _index, row in ranked)
+    return records
+
+
+def top_feature_records_table(records: list[dict[str, Any]]) -> Any:
+    import wandb
+
+    columns = [
+        "feature_id",
+        "activation",
+        "activation_score",
+        "record_id",
+        "prompt",
+        "media_type",
+        "media_path",
+        "token_index",
+        "token_phase",
+        "token_kind",
+        "token_role",
+        "tags_json",
+        "metadata_json",
+        "shard",
+    ]
+    table = wandb.Table(columns=columns)
+    for row in records:
+        token = row.get("token_info") or {}
+        table.add_data(
+            int(row.get("feature_id", -1)),
+            float(row.get("activation", 0.0)),
+            float(row.get("activation_score", 0.0)),
+            row.get("record_id"),
+            row.get("prompt"),
+            row.get("media_type"),
+            row.get("media_path"),
+            int(row.get("token_index", -1)),
+            token.get("phase"),
+            token.get("kind"),
+            token.get("role"),
+            json.dumps(row.get("tags", []), ensure_ascii=True),
+            json.dumps(row.get("metadata", {}), ensure_ascii=True, sort_keys=True),
+            row.get("shard"),
+        )
+    return table
+
+
+def flat_numeric_metrics(payload: dict[str, Any], *, prefix: str = "") -> dict[str, float]:
+    flat: dict[str, float] = {}
+    for key, value in payload.items():
+        name = f"{prefix}/{key}" if prefix else key
+        if isinstance(value, bool):
+            flat[name] = float(value)
+        elif isinstance(value, (int, float)):
+            flat[name] = float(value)
+        elif isinstance(value, dict):
+            flat.update(flat_numeric_metrics(value, prefix=name))
+    return flat
+
+
+def cmd_find_features(args: argparse.Namespace) -> int:
+    from .sae import load_sae
+
+    sae = load_sae(str(args.sae))
+    feature_ids = parse_feature_ids(args.feature_ids, sae.config.feature_dim)
+    records = collect_top_feature_records(
+        activation_dir=args.activation_dir,
+        sae=sae,
+        feature_ids=feature_ids,
+        top_n=args.top_n,
+        feature_rank=args.feature_rank,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=set(),
+    )
+    write_jsonl(args.output, records)
     print(json.dumps({"output": str(args.output), "num_records": len(records)}, indent=2))
     return 0
 
@@ -820,6 +1117,34 @@ def cmd_analyze_sae(args: argparse.Namespace) -> int:
         filters={"token_kinds": args.token_kinds, "phases": args.phases, "splits": args.splits},
         per_feature_path=str(per_feature_path),
     )
+    wandb_run = init_basic_wandb_run(
+        args,
+        job_type="analyze_sae",
+        config={
+            "activation_dir": str(args.activation_dir),
+            "sae": str(args.sae),
+            "output": str(args.output),
+            "batch_size": args.batch_size,
+            "device": args.device,
+            "token_kinds": args.token_kinds,
+            "phases": args.phases,
+            "splits": args.splits,
+        },
+    )
+    if wandb_run is not None:
+        analysis_metric = {f"analysis/{key}": value for key, value in flat_numeric_metrics(summary).items()}
+        mean_abs_when_active = activation_abs_sum / fire_counts.clamp_min(1).to(dtype=torch.float64)
+        add_wandb_histograms(
+            analysis_metric,
+            {
+                "hist/full_feature_fire_rate": fire_rate.float(),
+                "hist/full_feature_fire_count": fire_counts.float(),
+                "hist/full_feature_mean_abs_activation_when_active": mean_abs_when_active.float(),
+            },
+        )
+        wandb_run.log(analysis_metric)
+        wandb_run.summary.update({key: value for key, value in flat_numeric_metrics(summary).items()})
+        wandb_run.finish()
     ensure_dir(args.output.parent)
     args.output.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     write_jsonl(per_feature_path, per_feature_records)
@@ -849,6 +1174,25 @@ def feature_frequency_summary(
         for label, q in [("p00", 0.0), ("p01", 0.01), ("p05", 0.05), ("p10", 0.10), ("p50", 0.50), ("p90", 0.90), ("p99", 0.99), ("p100", 1.0)]:
             index = min(feature_dim - 1, max(0, int(round(q * (feature_dim - 1)))))
             quantiles[label] = float(sorted_rates[index].item())
+    fire_count_thresholds = {
+        "ge_1": fire_counts >= 1,
+        "ge_2": fire_counts >= 2,
+        "ge_10": fire_counts >= 10,
+    }
+    fire_rate_thresholds = {
+        "ge_1e_6": fire_rate >= 1e-6,
+        "ge_1e_5": fire_rate >= 1e-5,
+        "ge_1e_4": fire_rate >= 1e-4,
+        "ge_1e_3": fire_rate >= 1e-3,
+        "ge_1e_2": fire_rate >= 1e-2,
+    }
+    usage_thresholds = {
+        label: {
+            "count": int(mask.sum().item()),
+            "frac": float(mask.to(dtype=torch.float32).mean().item()) if feature_dim else 0.0,
+        }
+        for label, mask in {**fire_count_thresholds, **fire_rate_thresholds}.items()
+    }
     lowest_live = [
         {"feature_id": int(idx.item()), "fire_count": int(fire_counts[idx].item()), "fire_rate": float(fire_rate[idx].item())}
         for idx in sorted_idx[live_mask[sorted_idx]][:20]
@@ -870,10 +1214,12 @@ def feature_frequency_summary(
         "init_method": sae.config.init_method,
         "input_scale": float(sae.config.input_scale),
         "live_features": int(live_mask.sum().item()),
+        "live_feature_frac": float(live_mask.to(dtype=torch.float32).mean().item()) if feature_dim else 0.0,
         "dead_features": int((~live_mask).sum().item()),
         "dead_feature_frac": float((~live_mask).to(dtype=torch.float32).mean().item()) if feature_dim else 0.0,
         "mean_fire_rate": float(fire_rate.mean().item()) if feature_dim else 0.0,
         "fire_rate_quantiles": quantiles,
+        "feature_usage_thresholds": usage_thresholds,
         "lowest_live_features": lowest_live,
         "highest_fire_rate_features": highest,
         "group_counts": data.group_counts,
@@ -887,6 +1233,25 @@ def compact_activation_meta(meta: dict[str, Any]) -> dict[str, Any]:
 
 def activation_sidecar_name(shard_name: str) -> str:
     return f"metadata/{shard_name}.json"
+
+
+def activation_worker_metadata_name(*, worker_index: int, num_workers: int) -> str:
+    validate_worker_partition(worker_index=worker_index, num_workers=num_workers)
+    if num_workers == 1:
+        return "metadata.jsonl"
+    return f"metadata/worker_{worker_index:03d}.jsonl"
+
+
+def activation_record_assigned(index: int, *, worker_index: int, num_workers: int) -> bool:
+    validate_worker_partition(worker_index=worker_index, num_workers=num_workers)
+    return index % num_workers == worker_index
+
+
+def validate_worker_partition(*, worker_index: int, num_workers: int) -> None:
+    if num_workers < 1:
+        raise ValueError("--num-workers must be at least 1")
+    if worker_index < 0 or worker_index >= num_workers:
+        raise ValueError("--worker-index must be in [0, --num-workers)")
 
 
 def token_info_for_index(token_map: list[dict[str, Any]], token_index: int) -> dict[str, Any] | None:

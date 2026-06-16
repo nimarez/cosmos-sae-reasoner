@@ -82,6 +82,50 @@ The generated manifest points at `s3://...` media and can be used directly by
 `collect-activations`; uploaded S3 manifests can also be used as `--manifest
 s3://bucket/key.jsonl`.
 
+For a full RobotSim materialization, fan out the existing extractor across
+cheap CPU pods. Each worker owns a stable hash partition of tar shards, uploads
+its MP4s to the shared media prefix, and writes a per-worker manifest:
+
+```bash
+python -m tools.sae_reasoner.scripts.plan_robotsim_fanout \
+  --s3-uri s3://my-bucket/cosmos/robotsim/full_v1 \
+  --num-workers 8 \
+  --output-root outputs/sae_reasoner/robotsim_fanout/full_v1 \
+  --max-records-per-worker 0 \
+  --max-shards 0 \
+  --max-shard-gb 0
+```
+
+Copy one generated `scripts/run_worker_*.sh` command to each CPU pod, or run
+`outputs/sae_reasoner/robotsim_fanout/full_v1/run_all_local_parallel.sh` for a
+local smoke. Workers use `--resume`, so retrying skips already-uploaded media.
+After all worker manifests are uploaded, combine them into one sorted manifest:
+
+```bash
+python -m tools.sae_reasoner.scripts.combine_manifest_shards \
+  --input-prefix s3://my-bucket/cosmos/robotsim/full_v1/manifests/ \
+  --output outputs/sae_reasoner/manifests/robotsim_full_v1.jsonl \
+  --manifest-s3-uri s3://my-bucket/cosmos/robotsim/full_v1/final_manifest.jsonl
+```
+
+To use RobotSim's generated per-clip captions without re-uploading MP4s, enrich
+the combined manifest from the paired JSON sidecars. This preserves each
+`media_path`, replaces the generic prompt with the sidecar `caption`, and stores
+compact non-caption sidecar fields under `metadata.robotsim_sidecar`:
+
+```bash
+python -m tools.sae_reasoner.scripts.enrich_robotsim_manifest_sidecars \
+  --manifest s3://my-bucket/cosmos/robotsim/full_v1/final_manifest.jsonl \
+  --output outputs/sae_reasoner/manifests/robotsim_full_v1_captioned.jsonl \
+  --sidecar-s3-uri s3://my-bucket/cosmos/robotsim/full_v1/sidecars \
+  --manifest-s3-uri s3://my-bucket/cosmos/robotsim/full_v1/final_manifest_captioned.jsonl
+```
+
+For faster enrichment, run the same command across workers with unique local
+outputs and unique `--manifest-s3-uri` values, adding `--worker-index N
+--num-workers K`; then combine those captioned worker manifests with
+`combine_manifest_shards`.
+
 Generic HF file repos:
 
 ```bash
@@ -174,6 +218,22 @@ python -m tools.sae_reasoner collect-activations \
   --wandb-tags collection,cosmos3,sae \
   --max-examples 8
 
+# Large manifests can be collected across multiple GPU pods. The output prefix
+# is shared; each worker owns records by global manifest index modulo
+# --num-workers, writes stable per-record shards, and writes
+# metadata/worker_*.jsonl instead of clobbering metadata.jsonl.
+python -m tools.sae_reasoner.scripts.plan_activation_fanout \
+  --manifest s3://cosmos-interpretability/cosmos/robotsim/full_v1_stream_20260616/final_manifest_captioned.jsonl \
+  --output-dir s3://cosmos-interpretability/sae_reasoner/activations/robotsim_l18_full_prefill \
+  --output-root outputs/sae_reasoner/activation_fanout/robotsim_l18_full_prefill \
+  --num-workers 8 \
+  --layer 18 \
+  --phase prefill \
+  --activation-dtype bfloat16 \
+  --resume \
+  --wandb-project "${WANDB_PROJECT:-cosmos-sae-reasoner}" \
+  --run-prefix robotsim_l18_full_prefill
+
 python -m tools.sae_reasoner train-sae \
   --activation-dir "$ACTIVATION_URI" \
   --output outputs/sae_reasoner/saes/l18.pt \
@@ -252,12 +312,23 @@ with raw signed TopK via `--topk-activation topk`, `find-features` can rank by
 
 `train-sae` streams JSON metric rows during training and writes the same metrics
 to `<output>.metrics.jsonl`. Metrics include reconstruction loss, MSE,
-explained variance, L0, dead-feature fraction on the current batch, gradient
-norm, learning rate, tokens seen, elapsed seconds, and grouped reconstruction
-metrics for token classes such as `kind:video`, `kind:special`,
-`phase_kind:prefill:video`, and `role:user`. Set `WANDB_API_KEY` and pass
-`--wandb-project`, or set `WANDB_PROJECT` in the environment, to log the same
-metrics to W&B.
+explained variance, L0, batch-local feature firing/dead/usage summaries,
+train-vs-validation gaps, decoder-norm summaries, approximate decoder duplicate
+cosine summaries, gradient norm, learning rate, tokens seen, elapsed seconds,
+and grouped reconstruction metrics for token classes such as `kind:video`,
+`kind:special`, `phase_kind:prefill:video`, and `role:user`. Set
+`WANDB_API_KEY` and pass `--wandb-project`, or set `WANDB_PROJECT` in the
+environment, to log the same metrics to W&B. W&B runs also receive live
+histograms for batch-local feature fire rates/counts, token L0, active feature
+magnitudes, decoder norms, approximate nearest decoder cosine, and validation
+feature fire rates when validation is enabled. Use
+`--no-wandb-diagnostic-histograms` to disable those histogram payloads.
+When W&B is enabled, `train-sae` also runs a post-train top-activating-example
+pass on `feature_labeling` by default and attaches the results to the same run
+as a `top_activating_examples` table plus JSONL/HTML artifacts. Control it with
+`--feature-report-splits`, `--feature-report-max-features`,
+`--feature-report-top-n`, `--feature-report-rank`, or disable it with
+`--no-wandb-top-feature-table`.
 
 After training, run a full-dataset feature activity pass before selecting a
 checkpoint:
@@ -273,7 +344,9 @@ python -m tools.sae_reasoner analyze-sae \
 
 This writes a summary JSON plus `<output>.features.jsonl` with per-feature
 firing counts, firing rates, sign counts, and activation magnitudes across the
-selected tokens. Use these full-dataset dead/rare-feature metrics alongside W&B
+selected tokens. If W&B is enabled for `analyze-sae`, it logs full-dataset
+histograms for feature fire rate, fire count, and mean absolute active
+activation. Use these full-dataset dead/rare-feature metrics alongside W&B
 training curves; batch-local `dead_feature_frac_batch` is only a dynamics signal.
 
 For the BridgeData synthetic-caption prefill dataset, start with the compact

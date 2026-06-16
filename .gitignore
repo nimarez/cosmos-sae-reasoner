@@ -192,3 +192,9 @@ core.*
 /public/
 /dataset/
 /downloaded_data/
+
+# Local S3/rclone mounts and caches
+/s3/
+/.rclone-cache/
+/.rclone-logs/
+/.rclone-bin/

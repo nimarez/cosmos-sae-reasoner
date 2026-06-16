@@ -1,3 +1,4 @@
+import io
 import sys
 import tarfile
 import types
@@ -9,7 +10,11 @@ from tools.sae_reasoner.corpus import (
     build_from_hf_files,
     build_from_hf_tar_s3,
     build_from_s3_prefix,
+    download_hf_tar_shard,
+    list_hf_tar_shards_from_uri,
+    materialize_hf_tar_stream,
     parse_split_ratios,
+    partition_shards_for_worker,
     s3_key_for_tar_member,
     split_for_record_id,
 )
@@ -77,7 +82,7 @@ def test_robotics_recipe_uses_loose_videos(monkeypatch, tmp_path: Path):
     caption_path = tmp_path / "caption.txt"
     caption_path.write_text("A real per-clip robot caption.", encoding="utf-8")
 
-    def fake_download(repo_id: str, repo_type: str, filename: str):
+    def fake_download(repo_id: str, repo_type: str, filename: str, **_kwargs):
         assert repo_id == "nvidia/BridgeData2-Subset-Synthetic-Captions"
         assert repo_type == "dataset"
         assert filename == "sft_dataset_bridge/train/captions/episode_000015_clip000/caption.txt"
@@ -131,7 +136,7 @@ def test_build_from_hf_tar_s3_materializes_members(monkeypatch, tmp_path: Path):
             assert repo_type == "dataset"
             return ["README.md", "data/task/source/shard.tar"]
 
-    def fake_download(repo_id: str, repo_type: str, filename: str):
+    def fake_download(repo_id: str, repo_type: str, filename: str, **_kwargs):
         assert repo_id == "org/repo"
         assert repo_type == "dataset"
         assert filename == "data/task/source/shard.tar"
@@ -143,7 +148,7 @@ def test_build_from_hf_tar_s3_materializes_members(monkeypatch, tmp_path: Path):
         def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None):
             uploads.append((bucket, key, fileobj.read()))
 
-    fake_hf = types.SimpleNamespace(HfApi=lambda: FakeHfApi(), hf_hub_download=fake_download)
+    fake_hf = types.SimpleNamespace(HfApi=lambda: FakeHfApi(), hf_hub_download=fake_download, hf_hub_url=lambda **_kwargs: "https://hf.test")
     fake_boto3 = types.SimpleNamespace(client=lambda *_args, **_kwargs: FakeS3Client())
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
@@ -169,6 +174,187 @@ def test_build_from_hf_tar_s3_materializes_members(monkeypatch, tmp_path: Path):
     assert records[0]["media_path"] == "s3://bucket/prefix/media/org--repo/shard/videos/clip%201.mp4"
     assert records[0]["metadata"]["source"] == "hf-tar-s3"
     assert records[0]["metadata"]["member"] == "videos/clip 1.mp4"
+
+
+def test_hf_tar_s3_resume_skips_existing_upload(monkeypatch, tmp_path: Path):
+    tar_path = tmp_path / "shard.tar"
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.write_bytes(b"fake mp4")
+    with tarfile.open(tar_path, "w") as tar:
+        tar.add(clip_path, arcname="videos/clip.mp4")
+
+    class FakeHfApi:
+        def list_repo_files(self, repo_id: str, repo_type: str):
+            return ["data/task/source/shard.tar"]
+
+    def fake_download(repo_id: str, repo_type: str, filename: str, **_kwargs):
+        return str(tar_path)
+
+    uploads: list[str] = []
+
+    class FakeS3Client:
+        def head_object(self, Bucket, Key):
+            return {"ContentLength": 8}
+
+        def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None):
+            uploads.append(key)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=lambda: FakeHfApi(), hf_hub_download=fake_download, hf_hub_url=lambda **_kwargs: "https://hf.test"),
+    )
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=lambda *_args, **_kwargs: FakeS3Client()))
+
+    records = build_from_hf_tar_s3(
+        repo_id="org/repo",
+        shard_globs=("data/*/*/*.tar",),
+        member_globs=("*.mp4",),
+        prompt="Describe {stem}.",
+        tags=("robotics",),
+        s3_uri="s3://bucket/prefix",
+        max_records=0,
+        max_shards=None,
+        max_shard_gb=None,
+        seed=0,
+        split_ratios=(("sae_train", 1.0),),
+        media_type="auto",
+        resume=True,
+    )
+
+    assert len(records) == 1
+    assert uploads == []
+    assert records[0]["metadata"]["uploaded"] is False
+    assert records[0]["metadata"]["skipped_existing"] is True
+
+
+def test_hf_tar_s3_stream_materializes_members(monkeypatch, tmp_path: Path):
+    tar_bytes = io.BytesIO()
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.write_bytes(b"streamed mp4")
+    with tarfile.open(fileobj=tar_bytes, mode="w") as tar:
+        tar.add(clip_path, arcname="videos/clip.mp4")
+    tar_payload = tar_bytes.getvalue()
+
+    class FakeResponse:
+        def __init__(self, status_code: int, body: bytes = b""):
+            self.status_code = status_code
+            self.raw = io.BytesIO(body)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+        def close(self):
+            self.raw.close()
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"status {self.status_code}")
+
+    requests_calls: list[str] = []
+
+    class FakeRequests:
+        @staticmethod
+        def get(url, headers=None, stream=False, timeout=None):
+            requests_calls.append(url)
+            if url.endswith("/collision/isaaclab/shard.tar") and "/data/" not in url:
+                return FakeResponse(404)
+            return FakeResponse(200, tar_payload)
+
+    uploads: list[tuple[str, str, bytes]] = []
+
+    class FakeS3Client:
+        def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None):
+            uploads.append((bucket, key, fileobj.read()))
+
+    def fake_hf_hub_url(*, repo_id: str, filename: str, repo_type: str):
+        return f"https://hf.test/{repo_type}/{repo_id}/{filename}"
+
+    monkeypatch.setitem(sys.modules, "requests", FakeRequests)
+
+    records = materialize_hf_tar_stream(
+        hf_hub_url=fake_hf_hub_url,
+        repo_id="org/repo",
+        shard="collision/isaaclab/shard.tar",
+        member_globs=("*.mp4",),
+        prompt="Describe {stem}.",
+        tags=("robotics",),
+        bucket="bucket",
+        prefix="prefix",
+        repo_slug="org--repo",
+        s3=FakeS3Client(),
+        max_records=0,
+        seed=0,
+        split_ratios=(("sae_train", 1.0),),
+        media_type="auto",
+        resume=False,
+        shard_index=0,
+        worker_index=1,
+        num_workers=4,
+    )
+
+    assert len(records) == 1
+    assert requests_calls == [
+        "https://hf.test/dataset/org/repo/collision/isaaclab/shard.tar",
+        "https://hf.test/dataset/org/repo/data/collision/isaaclab/shard.tar",
+    ]
+    assert uploads == [("bucket", "prefix/media/org--repo/shard/videos/clip.mp4", b"streamed mp4")]
+    assert records[0]["metadata"]["shard"] == "data/collision/isaaclab/shard.tar"
+    assert records[0]["metadata"]["worker_index"] == 1
+
+
+def test_hf_tar_s3_worker_partition_is_stable():
+    shards = [f"data/task/source/shard-{idx:03d}.tar" for idx in range(12)]
+    worker_parts = [partition_shards_for_worker(shards, worker_index=idx, num_workers=3) for idx in range(3)]
+    flattened = sorted(shard for part in worker_parts for shard in part)
+
+    assert flattened == sorted(shards)
+    assert all(not (set(worker_parts[left]) & set(worker_parts[right])) for left in range(3) for right in range(left + 1, 3))
+    assert partition_shards_for_worker(shards, worker_index=1, num_workers=3) == worker_parts[1]
+
+
+def test_hf_tar_s3_shard_list_uri_filters_rows(tmp_path: Path):
+    shard_list = tmp_path / "shards.jsonl"
+    shard_list.write_text(
+        "\n".join(
+            [
+                '{"shard_path":"data/a/b/keep-small.tar","tar_bytes":10}',
+                '{"path":"data/a/b/skip-large.tar","tar_bytes":2000}',
+                '{"shard_path":"collision/isaaclab/robotsim-v1.0-collision-isaaclab-000000.tar","tar_bytes":10}',
+                '"data/a/b/keep-string.tar"',
+                '{"path":"data/a/b/not-text.txt","tar_bytes":10}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    shards = list_hf_tar_shards_from_uri(str(shard_list), shard_globs=("*/*/*.tar", "data/*/*/*.tar"), max_shard_bytes=100)
+
+    assert shards == [
+        "data/a/b/keep-small.tar",
+        "collision/isaaclab/robotsim-v1.0-collision-isaaclab-000000.tar",
+        "data/a/b/keep-string.tar",
+    ]
+
+
+def test_download_hf_tar_shard_retries_public_manifest_path():
+    calls: list[str] = []
+
+    def fake_download(*, repo_id: str, repo_type: str, filename: str):
+        calls.append(filename)
+        if filename == "collision/isaaclab/shard.tar":
+            raise FileNotFoundError(filename)
+        return f"/cache/{filename}"
+
+    shard, path = download_hf_tar_shard(fake_download, repo_id="org/repo", shard="collision/isaaclab/shard.tar")
+
+    assert shard == "data/collision/isaaclab/shard.tar"
+    assert path == "/cache/data/collision/isaaclab/shard.tar"
+    assert calls == ["collision/isaaclab/shard.tar", "data/collision/isaaclab/shard.tar"]
 
 
 def test_build_corpus_manifest_from_jsonl(tmp_path: Path):
