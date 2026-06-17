@@ -7,6 +7,9 @@ The code is intentionally direct-Python only. vLLM and NIM are useful serving
 paths, but they do not expose the residual-stream hooks needed for SAE training
 and feature multiplication.
 
+For end-to-end walkthroughs, see **[GUIDE.md](GUIDE.md)**: running the linear-probe
+baselines (and the SAE-vs-baseline comparison), and discovering and naming features.
+
 ## Quick Local Smoke
 
 These commands do not require model weights:
