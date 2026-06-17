@@ -1,0 +1,2055 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import random
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .artifacts import ensure_dir, write_jsonl
+from .manifest import iter_manifest, load_manifest, make_sample_manifest
+
+
+class RuntimeLoadError(RuntimeError):
+    pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except Exception as exc:
+        if isinstance(exc, RuntimeLoadError) or exc.__class__.__name__ == "RuntimeLoadError":
+            print(f"runtime error: {exc}")
+            return 2
+        raise
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="python -m tools.sae_reasoner")
+    sub = parser.add_subparsers(required=True)
+
+    p = sub.add_parser("prepare-snapshot", help="download/cache the HF snapshot")
+    p.add_argument("--model-id", default="nvidia/Cosmos3-Nano")
+    p.add_argument("--local-dir", default=None)
+    p.add_argument("--include-weights", action="store_true")
+    p.set_defaults(func=cmd_prepare_snapshot)
+
+    p = sub.add_parser("make-sample-jsonl", help="write a tiny sample manifest")
+    p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/sample_manifest.jsonl"))
+    p.set_defaults(func=cmd_make_sample_jsonl)
+
+    p = sub.add_parser("build-corpus-manifest", help="stream external corpus metadata into a neutral manifest")
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument(
+        "--source",
+        choices=[
+            "recipe",
+            "hf-files",
+            "hf-dataset",
+            "hf-tar-s3",
+            "hf-tar-range",
+            "hf-conversation-tar-s3",
+            "physical-ai-instruct",
+            "s3-prefix",
+            "jsonl",
+        ],
+        default="recipe",
+    )
+    p.add_argument("--recipe", default="robotics-bridge-captions")
+    p.add_argument("--hf-repo-id", default=None)
+    p.add_argument("--hf-split", default="train")
+    p.add_argument("--s3-uri", default=None)
+    p.add_argument("--input-uri", default=None)
+    p.add_argument("--include-glob", action="append", default=[])
+    p.add_argument("--member-glob", action="append", default=[], help="Tar member glob for tar-backed HF sources, e.g. '*.mp4'.")
+    p.add_argument("--prompt", default=None)
+    p.add_argument("--media-type", choices=["auto", "text", "image", "video"], default="auto")
+    p.add_argument("--max-records", type=int, default=1000)
+    p.add_argument("--max-shards", type=int, default=1, help="Maximum tar shards to scan for tar-backed HF sources after worker partitioning. Use 0 for all assigned shards.")
+    p.add_argument("--max-shard-gb", type=float, default=1.0, help="Skip tar shards larger than this for tar-backed HF sources. Use 0 for no size filter.")
+    p.add_argument("--shard-list", default=None, help="Optional local/S3 JSONL shard list for tar-backed HF sources. Rows may contain shard_path/path/shard.")
+    p.add_argument("--worker-index", type=int, default=0, help="Zero-based fan-out worker index for materializing tar-backed HF sources.")
+    p.add_argument("--num-workers", type=int, default=1, help="Total fan-out workers for materializing tar-backed HF sources.")
+    p.add_argument("--resume", action="store_true", help="For materialized HF sources, skip uploading media objects that already exist in S3.")
+    p.add_argument("--stream-tars", action="store_true", help="For hf-tar-s3, stream tar shards from Hugging Face instead of downloading each shard to disk.")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--split-ratios", default="sae_train=0.85,sae_val=0.10,feature_labeling=0.025,steering_eval=0.025")
+    p.add_argument("--manifest-s3-uri", default=None, help="Optional S3 URI to upload the generated manifest JSONL.")
+    p.add_argument("--id-field", default=None)
+    p.add_argument("--text-field", default=None)
+    p.add_argument("--prompt-field", default=None)
+    p.add_argument("--media-field", default=None)
+    p.add_argument("--shuffle-buffer", type=int, default=10000)
+    p.add_argument("--min-text-chars", type=int, default=64)
+    p.add_argument("--max-text-chars", type=int, default=8000)
+    p.add_argument("--target-tokens", type=int, default=0, help="Approximate total token budget for composite recipes. Use --max-records 0 to avoid the final record cap.")
+    p.add_argument("--estimated-image-tokens", type=int, default=1024)
+    p.add_argument("--estimated-video-tokens", type=int, default=4096)
+    p.add_argument("--estimated-text-tokens", type=int, default=256)
+    p.set_defaults(func=cmd_build_corpus_manifest)
+
+    p = sub.add_parser("inspect-model", help="load model and print hook points")
+    add_model_args(p)
+    p.set_defaults(func=cmd_inspect_model)
+
+    p = sub.add_parser("collect-activations", help="collect all-token prefill/decode activations")
+    add_model_args(p)
+    add_prompt_args(p)
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--layer", type=int, required=True)
+    p.add_argument(
+        "--output-dir",
+        required=True,
+        help="Local directory or S3 URI such as s3://bucket/prefix. S3 credentials are read from AWS env vars.",
+    )
+    p.add_argument("--max-examples", type=int, default=None)
+    p.add_argument("--resume", action="store_true", help="Skip records whose activation shard and metadata sidecar already exist.")
+    p.add_argument("--worker-index", type=int, default=0, help="Zero-based activation collection worker index.")
+    p.add_argument("--num-workers", type=int, default=1, help="Total activation collection workers. Records are assigned by global manifest index modulo this value.")
+    p.add_argument("--batch-size", type=int, default=1, help="Number of records per prefill forward pass. Decode collection currently requires 1.")
+    p.add_argument("--phase", choices=["prefill", "decode", "both"], default="prefill")
+    p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument(
+        "--activation-dtype",
+        choices=["auto", "float32", "bfloat16", "float16"],
+        default="bfloat16",
+        help="Saved activation dtype. Training casts sampled mini-batches to float32.",
+    )
+    add_wandb_args(p)
+    p.set_defaults(func=cmd_collect_activations)
+
+    p = sub.add_parser("train-sae", help="train a SAE from activation shards")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--expansion-factor", type=int, default=16)
+    p.add_argument("--top-k", type=int, default=32)
+    p.add_argument("--topk-activation", choices=["relu_topk", "topk", "batch_topk"], default="relu_topk")
+    p.add_argument("--batch-topk-momentum", type=float, default=0.01, help="EMA momentum for BatchTopK inference threshold.")
+    p.add_argument("--init-method", choices=["kaiming", "data"], default="kaiming")
+    p.add_argument("--init-blend", type=float, default=0.8, help="Data-point init blend p. Used when --init-method=data.")
+    p.add_argument("--activation-norm", choices=["sqrt_d", "none"], default="sqrt_d", help="Scale activations so average L2 norm is sqrt(hidden_dim).")
+    p.add_argument(
+        "--matryoshka-prefixes",
+        default="",
+        help=(
+            "Optional comma-separated nested dictionary cutoffs for Matryoshka SAE training. "
+            "Use absolute feature counts or fractions such as 0.125,0.25,0.5. Empty disables it."
+        ),
+    )
+    p.add_argument("--matryoshka-loss-coeff", type=float, default=1.0, help="Coefficient for summed Matryoshka prefix reconstruction losses.")
+    p.add_argument("--recon-loss", choices=["mse", "l1", "smooth_l1"], default="mse")
+    p.add_argument("--feature-l1-coeff", type=float, default=0.0)
+    p.add_argument("--steps", type=int, default=1000)
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--shuffle-seed", type=int, default=0, help="Seed for the without-replacement shuffled-epoch batch sampler.")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup-steps", type=int, default=0)
+    p.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant")
+    p.add_argument("--max-grad-norm", type=float, default=0.0, help="Clip gradient norm when >0. Always logs unclipped grad_norm.")
+    p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to train on. Empty means all.")
+    p.add_argument("--phases", default="", help="Optional comma-separated phases to train on. Empty means all.")
+    p.add_argument("--train-splits", default="sae_train", help="Comma-separated manifest splits used for training. Empty means all splits.")
+    p.add_argument("--stream", default="", help="Restrict to one Mixture-of-Transformers residual stream (e.g. 'ar'). Empty uses all; a load that spans multiple streams is rejected.")
+    p.add_argument("--val-splits", default="sae_val", help="Comma-separated manifest splits used for reconstruction validation. Empty disables validation.")
+    p.add_argument(
+        "--feature-report-splits",
+        default="feature_labeling",
+        help="Comma-separated manifest splits used for post-train top-activating-example logging. Empty disables it.",
+    )
+    p.add_argument("--feature-report-top-n", type=int, default=20, help="Top activating examples to keep per feature for the post-train feature report.")
+    p.add_argument("--feature-report-max-features", type=int, default=128, help="Maximum number of feature ids to include in the post-train feature report.")
+    p.add_argument("--feature-report-rank", choices=["absolute", "positive"], default="absolute", help="Ranking mode for post-train top-activating examples.")
+    p.add_argument("--val-batch-size", type=int, default=None, help="Validation sample size per metric row. Defaults to --batch-size.")
+    p.add_argument("--log-every", type=int, default=10, help="Emit training metrics every N steps.")
+    p.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Local directory or S3 prefix (s3://bucket/prefix) for resumable training checkpoints.",
+    )
+    p.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Write a checkpoint every N steps (and at the final step) when >0. Requires --checkpoint-dir.",
+    )
+    p.add_argument(
+        "--resume-from",
+        default=None,
+        help="Resume training from a checkpoint file or a directory/prefix (uses the latest checkpoint found).",
+    )
+    p.add_argument(
+        "--decoder-similarity-sample-size",
+        type=int,
+        default=256,
+        help="Number of decoder columns to sample for duplicate/correlation diagnostics. Use 0 to disable.",
+    )
+    p.add_argument(
+        "--no-wandb-diagnostic-histograms",
+        dest="wandb_diagnostic_histograms",
+        action="store_false",
+        help="Disable W&B histogram logging for SAE diagnostic distributions.",
+    )
+    p.add_argument(
+        "--no-wandb-top-feature-table",
+        dest="wandb_top_feature_table",
+        action="store_false",
+        help="Disable post-train top-activating-example logging to the training W&B run.",
+    )
+    p.set_defaults(wandb_diagnostic_histograms=True)
+    p.set_defaults(wandb_top_feature_table=True)
+    add_wandb_args(p)
+    p.set_defaults(func=cmd_train_sae)
+
+    p = sub.add_parser("find-features", help="rank top activating records/features")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--sae", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--top-n", type=int, default=20)
+    p.add_argument("--feature-ids", type=str, default="")
+    p.add_argument("--feature-rank", choices=["absolute", "positive"], default="absolute")
+    p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to include. Empty means all.")
+    p.add_argument("--phases", default="", help="Optional comma-separated token phases to include. Empty means all.")
+    p.set_defaults(func=cmd_find_features)
+
+    p = sub.add_parser("analyze-sae", help="compute full-dataset SAE feature firing statistics")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--sae", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True, help="Summary JSON path. Per-feature JSONL is written beside it.")
+    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--device", default=None)
+    p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to analyze. Empty means all.")
+    p.add_argument("--phases", default="", help="Optional comma-separated token phases to analyze. Empty means all.")
+    p.add_argument("--splits", default="sae_train,sae_val", help="Comma-separated manifest splits to analyze. Empty means all.")
+    add_wandb_args(p)
+    p.set_defaults(func=cmd_analyze_sae)
+
+    p = sub.add_parser("decompose-activations", help="fit an unsupervised linear basis (PCA/ICA) over activations")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--output", type=Path, required=True, help="Basis checkpoint path (.pt). Summary JSON is written beside it.")
+    p.add_argument("--method", choices=["pca", "ica"], default="pca")
+    p.add_argument("--n-components", type=int, default=64)
+    p.add_argument("--whiten", action="store_true", help="PCA only: scale each projection to unit variance.")
+    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--max-samples", type=int, default=50000, help="ICA only: cap the random subsample (ICA is not streamable).")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to include. Empty means all.")
+    p.add_argument("--phases", default="", help="Optional comma-separated token phases to include. Empty means all.")
+    p.add_argument("--splits", default="sae_train,sae_val", help="Comma-separated manifest splits to include. Empty means all.")
+    p.add_argument("--stream", default="", help="Restrict to one residual stream (e.g. 'ar'). A multi-stream load is rejected.")
+    add_wandb_args(p)
+    p.set_defaults(func=cmd_decompose_activations)
+
+    p = sub.add_parser("find-components", help="rank top-projecting records/tokens per decomposition component")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--basis", type=Path, required=True, help="Decomposition basis from decompose-activations.")
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--top-n", type=int, default=20)
+    p.add_argument("--component-ids", type=str, default="", help="Comma-separated component ids. Empty means up to the first 128.")
+    p.add_argument("--feature-rank", choices=["absolute", "positive"], default="absolute", help="Components are signed; 'absolute' ranks by |projection|.")
+    p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to include. Empty means all.")
+    p.add_argument("--phases", default="", help="Optional comma-separated token phases to include. Empty means all.")
+    p.set_defaults(func=cmd_find_components)
+
+    p = sub.add_parser(
+        "train-linear-probe",
+        help="train a logistic-regression probe baseline on raw activations (arXiv:2502.16681)",
+    )
+    add_probe_common_args(p)
+    p.add_argument("--penalty", choices=["l2", "l1"], default="l2", help="Logistic-regression penalty. 'l2' is the paper baseline.")
+    p.set_defaults(func=cmd_train_linear_probe)
+
+    p = sub.add_parser(
+        "compare-sae-probe",
+        help="compare an SAE-feature probe against the raw-activation baseline (arXiv:2502.16681)",
+    )
+    add_probe_common_args(p)
+    p.add_argument("--sae", type=Path, required=True, help="Trained SAE checkpoint.")
+    p.add_argument("--k-values", default="16,128", help="Comma-separated top-k latent counts for the SAE probe (paper uses 16,128).")
+    p.add_argument("--penalty", choices=["l2", "l1"], default="l2", help="Baseline (raw-activation) probe penalty.")
+    p.add_argument("--sae-penalty", choices=["l1", "l2"], default="l1", help="SAE-feature probe penalty (paper uses L1).")
+    p.add_argument("--decomp-basis", type=Path, default=None, help="Optional PCA/ICA basis (decompose-activations); adds an unsupervised-direction probe baseline.")
+    p.add_argument("--batch-size", type=int, default=4096, help="Encode batch size for SAE feature extraction.")
+    p.add_argument("--device", default=None, help="Device for SAE encoding (default cpu).")
+    p.set_defaults(func=cmd_compare_sae_probe)
+
+    p = sub.add_parser("render-feature-report", help="render feature examples as a standalone HTML report")
+    p.add_argument("--features", type=Path, required=True)
+    p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/reports/features.html"))
+    p.add_argument("--title", default="Cosmos SAE Feature Browser")
+    p.set_defaults(func=cmd_render_feature_report)
+
+    p = sub.add_parser("find-neighbors", help="find nearest activation-token neighbors by cosine similarity")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--max-tokens", type=int, default=5000)
+    p.add_argument("--num-queries", type=int, default=40)
+    p.add_argument("--neighbors", type=int, default=8)
+    p.add_argument("--query-kinds", default="", help="Comma-separated token kinds, e.g. image,video,text. Empty means all.")
+    p.add_argument("--seed", type=int, default=0)
+    p.set_defaults(func=cmd_find_neighbors)
+
+    p = sub.add_parser("render-neighbor-report", help="render nearest-token activation neighbors as standalone HTML")
+    p.add_argument("--neighbors", type=Path, required=True)
+    p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/reports/neighbors.html"))
+    p.add_argument("--title", default="Cosmos Activation Nearest Neighbors")
+    p.set_defaults(func=cmd_render_neighbor_report)
+
+    p = sub.add_parser("steer", help="baseline vs steered generation")
+    add_model_args(p)
+    add_prompt_args(p)
+    p.add_argument("--sae", type=Path, required=True)
+    p.add_argument("--layer", type=int, required=True)
+    p.add_argument("--feature-id", type=int, required=True)
+    p.add_argument("--multiplier", type=float, required=True)
+    p.add_argument("--scope", choices=["prefill", "decode", "both"], default="decode")
+    p.add_argument("--prompt", default=None, help="Text-only prompt. Use --manifest for multimodal steering.")
+    p.add_argument("--manifest", type=Path, default=None, help="Optional manifest JSONL containing the record to steer.")
+    p.add_argument("--record-id", default=None, help="Record id inside --manifest. Defaults to the first manifest record.")
+    p.add_argument("--steer-token-kinds", default="", help="Optional comma-separated prefill token kinds to edit, e.g. video,image,special.")
+    p.add_argument("--steer-roles", default="", help="Optional comma-separated prefill chat roles to edit, e.g. user,assistant.")
+    p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/reports/steer_result.json"))
+    p.set_defaults(func=cmd_steer)
+    return parser
+
+
+def add_probe_common_args(parser: argparse.ArgumentParser) -> None:
+    """Args shared by `train-linear-probe` and `compare-sae-probe` (arXiv:2502.16681)."""
+    parser.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    parser.add_argument("--manifest", required=True, help="Manifest JSONL (local/http/s3) supplying per-record labels.")
+    g = parser.add_mutually_exclusive_group(required=True)
+    g.add_argument("--label-tag", default=None, help="Binary label: 1 if the record has this tag else 0.")
+    g.add_argument("--label-key", default=None, help="Label from record.metadata[KEY]; records missing it are dropped.")
+    g.add_argument("--label-field", default=None, help="Label from a record field (e.g. media_type). Good smoke test.")
+    parser.add_argument("--aggregation", choices=["last", "mean", "max"], default="last", help="Per-record token reduction. 'last' matches the paper.")
+    parser.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to include. Empty means all.")
+    parser.add_argument("--phases", default="", help="Optional comma-separated token phases to include. Empty means all.")
+    parser.add_argument("--splits", default="", help="Comma-separated manifest splits to include. Empty means all.")
+    parser.add_argument("--stream", default="", help="Restrict to one residual stream (e.g. 'ar'). Empty uses all; a multi-stream load is rejected.")
+    parser.add_argument("--max-train", type=int, default=1024, help="Cap training examples (paper uses 1024). <=0 disables.")
+    parser.add_argument("--test-frac", type=float, default=0.2)
+    parser.add_argument("--no-standardize", dest="standardize", action="store_false", help="Disable z-scoring of features before the probe.")
+    parser.set_defaults(standardize=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output", type=Path, required=True, help="Summary JSON path.")
+
+
+def add_model_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model-id", default="nvidia/Cosmos3-Nano")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "bf16", "float16", "fp16", "float32", "fp32"])
+    parser.add_argument(
+        "--init-mode",
+        default="pretrained",
+        choices=["pretrained", "random", "meta"],
+        help=(
+            "pretrained loads checkpoint weights; random builds full-size random weights from config; "
+            "meta builds the full architecture on meta tensors for inspection only"
+        ),
+    )
+
+
+def add_prompt_args(parser: argparse.ArgumentParser) -> None:
+    parser.set_defaults(prompt_format="chat")
+    parser.add_argument(
+        "--system-prompt",
+        default=None,
+        help="Optional system prompt passed through the model processor chat template.",
+    )
+
+
+def add_wandb_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--wandb-project", default=None, help="Optional W&B project. Also read from WANDB_PROJECT.")
+    parser.add_argument("--wandb-entity", default=None, help="Optional W&B entity. Also read from WANDB_ENTITY.")
+    parser.add_argument("--wandb-run-name", default=None, help="Optional W&B run name.")
+    parser.add_argument("--wandb-tags", default="", help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb-mode", default=None, choices=["online", "offline", "disabled"], help="W&B mode. Also read from WANDB_MODE.")
+
+
+def cmd_prepare_snapshot(args: argparse.Namespace) -> int:
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:
+        raise RuntimeLoadError("Missing huggingface_hub. Install it before preparing the snapshot.") from exc
+    ignore_patterns = None if args.include_weights else ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt"]
+    path = snapshot_download(
+        repo_id=args.model_id,
+        local_dir=args.local_dir,
+        ignore_patterns=ignore_patterns,
+    )
+    print(json.dumps({"snapshot_path": path, "include_weights": bool(args.include_weights)}, indent=2))
+    return 0
+
+
+def cmd_make_sample_jsonl(args: argparse.Namespace) -> int:
+    samples = make_sample_manifest(args.output)
+    print(json.dumps({"output": str(args.output), "num_records": len(samples)}, indent=2))
+    return 0
+
+
+def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
+    from .corpus import BuildCorpusConfig, build_corpus_manifest, parse_split_ratios
+
+    records = build_corpus_manifest(
+        BuildCorpusConfig(
+            output=args.output,
+            source=args.source,
+            recipe=args.recipe,
+            hf_repo_id=args.hf_repo_id,
+            hf_split=args.hf_split,
+            s3_uri=args.s3_uri,
+            input_uri=args.input_uri,
+            include_globs=tuple(args.include_glob),
+            member_globs=tuple(args.member_glob),
+            prompt=args.prompt,
+            media_type=args.media_type,
+            max_records=args.max_records,
+            max_shards=None if args.max_shards == 0 else args.max_shards,
+            max_shard_gb=None if args.max_shard_gb == 0 else args.max_shard_gb,
+            shard_list_uri=args.shard_list,
+            worker_index=args.worker_index,
+            num_workers=args.num_workers,
+            resume=args.resume,
+            stream_tars=args.stream_tars,
+            seed=args.seed,
+            split_ratios=parse_split_ratios(args.split_ratios),
+            id_field=args.id_field,
+            text_field=args.text_field,
+            prompt_field=args.prompt_field,
+            media_field=args.media_field,
+            shuffle_buffer=args.shuffle_buffer,
+            min_text_chars=args.min_text_chars,
+            max_text_chars=args.max_text_chars,
+            target_tokens=args.target_tokens,
+            estimated_image_tokens=args.estimated_image_tokens,
+            estimated_video_tokens=args.estimated_video_tokens,
+            estimated_text_tokens=args.estimated_text_tokens,
+        )
+    )
+    manifest_uri = None
+    if args.manifest_s3_uri:
+        manifest_uri = upload_file_to_s3(args.output, args.manifest_s3_uri)
+    split_counts: dict[str, int] = {}
+    media_counts: dict[str, int] = {}
+    for record in records:
+        metadata = record.get("metadata") or {}
+        split = metadata.get("split", "unknown")
+        split_counts[split] = split_counts.get(split, 0) + 1
+        media_type = record.get("media_type", "unknown")
+        media_counts[media_type] = media_counts.get(media_type, 0) + 1
+    estimated_tokens = sum(int((record.get("metadata") or {}).get("estimated_tokens") or 0) for record in records)
+    print(
+        json.dumps(
+            {
+                "output": str(args.output),
+                "manifest_uri": manifest_uri,
+                "num_records": len(records),
+                "split_counts": split_counts,
+                "media_counts": media_counts,
+                "estimated_tokens": estimated_tokens,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def upload_file_to_s3(path: Path, uri: str) -> str:
+    from .storage import parse_s3_uri, s3_client
+
+    bucket, key = parse_s3_uri(uri)
+    s3_client().upload_file(
+        str(path),
+        bucket,
+        key,
+        ExtraArgs={"ContentType": "application/jsonl; charset=utf-8"},
+    )
+    return f"s3://{bucket}/{key}"
+
+
+def cmd_inspect_model(args: argparse.Namespace) -> int:
+    from .runtime import CosmosReasonerRuntime
+
+    runtime = CosmosReasonerRuntime(
+        args.model_id,
+        device=args.device,
+        dtype=args.dtype,
+        init_mode=args.init_mode,
+    ).load()
+    print(json.dumps(runtime.describe(), indent=2))
+    return 0
+
+
+def cmd_collect_activations(args: argparse.Namespace) -> int:
+    import torch
+
+    from .runtime import CosmosReasonerRuntime
+    from .storage import make_activation_store
+
+    validate_worker_partition(worker_index=args.worker_index, num_workers=args.num_workers)
+    store = make_activation_store(args.output_dir)
+    wandb_run = init_basic_wandb_run(
+        args,
+        job_type="collect_activations",
+        config={
+            "model_id": args.model_id,
+            "device": args.device,
+            "dtype": args.dtype,
+            "init_mode": args.init_mode,
+            "manifest": args.manifest,
+            "layer": args.layer,
+            "output_dir": args.output_dir,
+            "max_examples": args.max_examples,
+            "resume": args.resume,
+            "worker_index": args.worker_index,
+            "num_workers": args.num_workers,
+            "batch_size": args.batch_size,
+            "phase": args.phase,
+            "max_new_tokens": args.max_new_tokens,
+            "activation_dtype": args.activation_dtype,
+            "prompt_format": args.prompt_format,
+            "system_prompt": args.system_prompt,
+        },
+    )
+    runtime = CosmosReasonerRuntime(
+        args.model_id,
+        device=args.device,
+        dtype=args.dtype,
+        init_mode=args.init_mode,
+    ).load()
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.batch_size != 1 and args.phase != "prefill":
+        raise ValueError("--batch-size greater than 1 is currently supported only with --phase prefill")
+    metadata: list[dict[str, Any]] = []
+    start = time.time()
+    total_tokens = 0
+    total_activation_bytes = 0
+    skipped_examples = 0
+    processed_examples = 0
+    pending: list[tuple[int, Any, str, str]] = []
+
+    def flush_pending() -> None:
+        nonlocal total_tokens, total_activation_bytes
+        if not pending:
+            return
+        batch = list(pending)
+        pending.clear()
+        batch_start = time.time()
+        if args.batch_size == 1:
+            results = [
+                runtime.collect_activations(
+                    record,
+                    layer=args.layer,
+                    phase=args.phase,
+                    max_new_tokens=args.max_new_tokens,
+                    prompt_format=args.prompt_format,
+                    system_prompt=args.system_prompt,
+                    activation_dtype=args.activation_dtype,
+                )
+                for _idx, record, _shard_name, _sidecar_name in batch
+            ]
+        else:
+            results = runtime.collect_prefill_batch(
+                [record for _idx, record, _shard_name, _sidecar_name in batch],
+                layer=args.layer,
+                prompt_format=args.prompt_format,
+                system_prompt=args.system_prompt,
+                activation_dtype=args.activation_dtype,
+            )
+        batch_seconds = max(1e-9, time.time() - batch_start)
+        per_record_seconds = batch_seconds / max(1, len(batch))
+        for (record_idx, record, shard_name, sidecar_name), (hidden, meta) in zip(batch, results):
+            shard_uri = store.write_torch(shard_name, {"activations": hidden, "meta": meta})
+            meta["shard"] = shard_name
+            meta["shard_uri"] = shard_uri
+            compact_meta = compact_activation_meta(meta)
+            metadata.append(compact_meta)
+            store.write_text(sidecar_name, json.dumps(compact_meta, ensure_ascii=True, sort_keys=True) + "\n")
+            elapsed = max(1e-9, time.time() - start)
+            activation_bytes = int(hidden.numel() * hidden.element_size())
+            total_tokens += int(meta["num_tokens"])
+            total_activation_bytes += activation_bytes
+            metric = collect_metric(
+                idx=len(metadata) - 1,
+                meta=meta,
+                activation_bytes=activation_bytes,
+                total_tokens=total_tokens,
+                total_activation_bytes=total_activation_bytes,
+                elapsed_seconds=elapsed,
+                record_seconds=per_record_seconds,
+            )
+            metric["collection_batch_size"] = len(batch)
+            metric["batch_seconds"] = batch_seconds
+            print(
+                json.dumps(
+                    {
+                        "event": "collect_metric",
+                        **metric,
+                        "record_index": record_idx,
+                        "worker_index": args.worker_index,
+                        "num_workers": args.num_workers,
+                        "collected": record.id,
+                        "shard": shard_name,
+                        "uri": shard_uri,
+                    }
+                ),
+                flush=True,
+            )
+            if wandb_run is not None:
+                wandb_run.log(metric, step=int(metric["collected_examples"]))
+
+    for idx, record in enumerate(iter_manifest(args.manifest)):
+        if args.max_examples is not None and idx >= args.max_examples:
+            break
+        if not activation_record_assigned(idx, worker_index=args.worker_index, num_workers=args.num_workers):
+            continue
+        shard_name = shard_name_for_record(idx, record.id)
+        sidecar_name = activation_sidecar_name(shard_name)
+        processed_examples += 1
+        if args.resume and store.exists(shard_name) and store.exists(sidecar_name):
+            sidecar = json.loads(store.read_text(sidecar_name))
+            metadata.append(sidecar)
+            skipped_examples += 1
+            print(
+                json.dumps(
+                    {
+                        "event": "collect_skip",
+                        "record_index": idx,
+                        "worker_index": args.worker_index,
+                        "num_workers": args.num_workers,
+                        "skipped_examples": skipped_examples,
+                        "record_id": record.id,
+                        "shard": shard_name,
+                    }
+                ),
+                flush=True,
+            )
+            continue
+        pending.append((idx, record, shard_name, sidecar_name))
+        if len(pending) >= args.batch_size:
+            flush_pending()
+    flush_pending()
+    metadata_text = "".join(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n" for record in metadata)
+    metadata_name = activation_worker_metadata_name(worker_index=args.worker_index, num_workers=args.num_workers)
+    metadata_uri = store.write_text(metadata_name, metadata_text)
+    final_total_tokens = sum(activation_meta_tokens(record) for record in metadata)
+    final_total_activation_bytes = sum(activation_meta_bytes(record) for record in metadata)
+    summary = {
+        "event": "collect_complete",
+        "examples": len(metadata),
+        "new_examples": len(metadata) - skipped_examples,
+        "skipped_examples": skipped_examples,
+        "worker_index": args.worker_index,
+        "num_workers": args.num_workers,
+        "total_tokens": final_total_tokens,
+        "total_activation_gb": final_total_activation_bytes / 1_000_000_000,
+        "metadata_uri": metadata_uri,
+    }
+    print(json.dumps(summary), flush=True)
+    if wandb_run is not None:
+        wandb_run.summary.update(
+            {
+                "final_collected_examples": len(metadata),
+                "final_new_examples": len(metadata) - skipped_examples,
+                "final_skipped_examples": skipped_examples,
+                "worker_index": args.worker_index,
+                "num_workers": args.num_workers,
+                "final_total_tokens": final_total_tokens,
+                "final_total_activation_gb": final_total_activation_bytes / 1_000_000_000,
+                "metadata_uri": metadata_uri,
+            }
+        )
+        wandb_run.finish()
+    return 0
+
+
+def collect_metric(
+    *,
+    idx: int,
+    meta: dict[str, Any],
+    activation_bytes: int,
+    total_tokens: int,
+    total_activation_bytes: int,
+    elapsed_seconds: float,
+    record_seconds: float,
+) -> dict[str, float | int | str]:
+    token_kind_counts = meta.get("token_kind_counts") or {}
+    token_phase_counts = meta.get("token_phase_counts") or {}
+    tokens = int(meta.get("num_tokens") or 0)
+    metric: dict[str, float | int | str] = {
+        "collected_examples": idx + 1,
+        "tokens": tokens,
+        "total_tokens": total_tokens,
+        "record_seconds": record_seconds,
+        "elapsed_seconds": elapsed_seconds,
+        "examples_per_min": 60.0 * float(idx + 1) / elapsed_seconds,
+        "tokens_per_sec": float(total_tokens) / elapsed_seconds,
+        "activation_bytes": activation_bytes,
+        "total_activation_gb": total_activation_bytes / 1_000_000_000,
+        "activation_dtype": str(meta.get("activation_dtype") or ""),
+    }
+    for kind, count in token_kind_counts.items():
+        metric[f"token_kind/{kind}"] = int(count)
+    for phase, count in token_phase_counts.items():
+        metric[f"token_phase/{phase}"] = int(count)
+    return metric
+
+
+def activation_meta_tokens(meta: dict[str, Any]) -> int:
+    return int(meta.get("num_tokens") or 0)
+
+
+def activation_meta_bytes(meta: dict[str, Any]) -> int:
+    tokens = activation_meta_tokens(meta)
+    hidden_dim = int(meta.get("hidden_dim") or 0)
+    return tokens * hidden_dim * activation_dtype_bytes(str(meta.get("activation_dtype") or ""))
+
+
+def activation_dtype_bytes(dtype: str) -> int:
+    if dtype in {"float32", "fp32"}:
+        return 4
+    if dtype in {"bfloat16", "bf16", "float16", "fp16"}:
+        return 2
+    return 0
+
+
+def cmd_train_sae(args: argparse.Namespace) -> int:
+    from .sae import save_sae, train_sae_from_tensor
+
+    if args.checkpoint_every > 0 and not args.checkpoint_dir:
+        raise ValueError("--checkpoint-every requires --checkpoint-dir")
+
+    train_data = load_activation_dataset(
+        args.activation_dir,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=parse_kind_filter(args.train_splits),
+        stream=args.stream or None,
+    )
+    if train_data.activations is None:
+        raise ValueError(f"no training activation shards found in {args.activation_dir}")
+    val_splits = parse_kind_filter(args.val_splits)
+    val_data = (
+        load_activation_dataset(
+            args.activation_dir,
+            token_kinds=parse_kind_filter(args.token_kinds),
+            phases=parse_kind_filter(args.phases),
+            splits=val_splits,
+            stream=args.stream or None,
+            allow_empty=True,
+        )
+        if val_splits
+        else None
+    )
+    activations = train_data.activations
+    validation_activations = val_data.activations if val_data is not None else None
+    wandb_run = init_wandb_run(
+        args,
+        num_activations=int(activations.shape[0]),
+        hidden_dim=int(activations.shape[1]),
+        train_group_counts=train_data.group_counts,
+        val_group_counts=val_data.group_counts if val_data is not None else {},
+    )
+
+    def log_progress(metric: dict[str, Any]) -> None:
+        public_metric = public_metric_payload(metric)
+        record = {"event": "train_metric", **public_metric}
+        print(json.dumps(record), flush=True)
+        if wandb_run is not None:
+            wandb_metric = dict(public_metric)
+            add_wandb_histograms(wandb_metric, metric.get("_wandb_histograms", {}))
+            wandb_run.log(wandb_metric, step=int(public_metric["step"]))
+
+    sae, metrics = train_sae_from_tensor(
+        activations,
+        validation_activations=validation_activations,
+        token_groups=train_data.token_groups,
+        validation_token_groups=val_data.token_groups if val_data is not None else None,
+        expansion_factor=args.expansion_factor,
+        top_k=args.top_k,
+        topk_activation=args.topk_activation,
+        batch_topk_momentum=args.batch_topk_momentum,
+        init_method=args.init_method,
+        init_blend=args.init_blend,
+        activation_norm=args.activation_norm,
+        matryoshka_prefixes=args.matryoshka_prefixes,
+        matryoshka_loss_coeff=args.matryoshka_loss_coeff,
+        recon_loss=args.recon_loss,
+        feature_l1_coeff=args.feature_l1_coeff,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        shuffle_seed=args.shuffle_seed,
+        lr=args.lr,
+        warmup_steps=args.warmup_steps,
+        lr_schedule=args.lr_schedule,
+        max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
+        val_batch_size=args.val_batch_size,
+        log_every=args.log_every,
+        progress_callback=log_progress,
+        log_diagnostic_histograms=bool(wandb_run is not None and args.wandb_diagnostic_histograms),
+        decoder_similarity_sample_size=args.decoder_similarity_sample_size,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_every=args.checkpoint_every if args.checkpoint_every > 0 else None,
+        resume_from=args.resume_from,
+    )
+    ensure_dir(args.output.parent)
+    save_sae(
+        str(args.output),
+        sae,
+        metadata={
+            "metrics": metrics,
+            "recon_loss": args.recon_loss,
+            "feature_l1_coeff": args.feature_l1_coeff,
+            "topk_activation": args.topk_activation,
+            "batch_topk_momentum": args.batch_topk_momentum,
+            "init_method": args.init_method,
+            "init_blend": args.init_blend,
+            "activation_norm": args.activation_norm,
+            "matryoshka_prefixes": args.matryoshka_prefixes,
+            "matryoshka_loss_coeff": args.matryoshka_loss_coeff,
+            "token_kinds": args.token_kinds,
+            "phases": args.phases,
+            "train_splits": args.train_splits,
+            "val_splits": args.val_splits,
+            "feature_report_splits": args.feature_report_splits,
+            "feature_report_top_n": args.feature_report_top_n,
+            "feature_report_max_features": args.feature_report_max_features,
+            "feature_report_rank": args.feature_report_rank,
+            "val_batch_size": args.val_batch_size,
+            "lr": args.lr,
+            "warmup_steps": args.warmup_steps,
+            "lr_schedule": args.lr_schedule,
+            "max_grad_norm": args.max_grad_norm,
+            "decoder_similarity_sample_size": args.decoder_similarity_sample_size,
+            "wandb_diagnostic_histograms": args.wandb_diagnostic_histograms,
+            "wandb_top_feature_table": args.wandb_top_feature_table,
+            "wandb": wandb_run_metadata(wandb_run),
+            "train_group_counts": train_data.group_counts,
+            "val_group_counts": val_data.group_counts if val_data is not None else {},
+        },
+    )
+    write_jsonl(args.output.with_suffix(".metrics.jsonl"), metrics)
+    top_feature_artifacts = maybe_log_top_feature_examples(
+        wandb_run=wandb_run if args.wandb_top_feature_table else None,
+        sae=sae,
+        activation_dir=args.activation_dir,
+        output_root=args.output,
+        splits=parse_kind_filter(args.feature_report_splits),
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        max_features=args.feature_report_max_features,
+        top_n=args.feature_report_top_n,
+        feature_rank=args.feature_report_rank,
+        title=f"Top Activating SAE Features: {args.output.stem}",
+    )
+    if wandb_run is not None:
+        wandb_run.summary.update(
+            {
+                "final_loss": metrics[-1]["loss"] if metrics else None,
+                "final_recon_loss": metrics[-1]["recon_loss"] if metrics else None,
+                "final_explained_variance": metrics[-1].get("explained_variance") if metrics else None,
+                "final_val_explained_variance": metrics[-1].get("val_explained_variance") if metrics else None,
+                "final_grad_norm": metrics[-1].get("grad_norm") if metrics else None,
+                "sae_output": str(args.output),
+                **top_feature_artifacts,
+            }
+        )
+        wandb_run.finish()
+    print(json.dumps({"output": str(args.output), "num_activations": int(activations.shape[0]), "metrics": metrics[-1]}, indent=2))
+    return 0
+
+
+def init_wandb_run(
+    args: argparse.Namespace,
+    *,
+    num_activations: int,
+    hidden_dim: int,
+    train_group_counts: dict[str, int] | None = None,
+    val_group_counts: dict[str, int] | None = None,
+) -> Any | None:
+    config = {
+        "activation_dir": str(args.activation_dir),
+        "output": str(args.output),
+        "num_activations": num_activations,
+        "hidden_dim": hidden_dim,
+        "expansion_factor": args.expansion_factor,
+        "top_k": args.top_k,
+        "topk_activation": args.topk_activation,
+        "batch_topk_momentum": args.batch_topk_momentum,
+        "init_method": args.init_method,
+        "init_blend": args.init_blend,
+        "activation_norm": args.activation_norm,
+        "matryoshka_prefixes": args.matryoshka_prefixes,
+        "matryoshka_loss_coeff": args.matryoshka_loss_coeff,
+        "recon_loss": args.recon_loss,
+        "feature_l1_coeff": args.feature_l1_coeff,
+        "steps": args.steps,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
+        "lr_schedule": args.lr_schedule,
+        "max_grad_norm": args.max_grad_norm,
+        "token_kinds": args.token_kinds,
+        "phases": args.phases,
+        "train_splits": args.train_splits,
+        "val_splits": args.val_splits,
+        "feature_report_splits": args.feature_report_splits,
+        "feature_report_top_n": args.feature_report_top_n,
+        "feature_report_max_features": args.feature_report_max_features,
+        "feature_report_rank": args.feature_report_rank,
+        "val_batch_size": args.val_batch_size,
+        "log_every": args.log_every,
+        "decoder_similarity_sample_size": args.decoder_similarity_sample_size,
+        "wandb_diagnostic_histograms": args.wandb_diagnostic_histograms,
+        "wandb_top_feature_table": args.wandb_top_feature_table,
+        "train_group_counts": train_group_counts or {},
+        "val_group_counts": val_group_counts or {},
+    }
+    return init_basic_wandb_run(args, job_type="train_sae", config=config)
+
+
+def init_basic_wandb_run(args: argparse.Namespace, *, job_type: str, config: dict[str, Any]) -> Any | None:
+    project = args.wandb_project or __import__("os").environ.get("WANDB_PROJECT")
+    mode = args.wandb_mode or __import__("os").environ.get("WANDB_MODE")
+    if not project and mode != "offline":
+        return None
+    try:
+        import wandb
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeLoadError("W&B logging requested but wandb is not installed. Run `uv pip install wandb`.") from exc
+    tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+    return wandb.init(
+        project=project or "cosmos-sae-reasoner",
+        entity=args.wandb_entity or __import__("os").environ.get("WANDB_ENTITY"),
+        name=args.wandb_run_name,
+        tags=tags,
+        job_type=job_type,
+        mode=mode,
+        config=config,
+    )
+
+
+def wandb_run_metadata(run: Any | None) -> dict[str, Any] | None:
+    if run is None:
+        return None
+    return {
+        "project": getattr(run, "project", None),
+        "entity": getattr(run, "entity", None),
+        "name": getattr(run, "name", None),
+        "id": getattr(run, "id", None),
+        "url": getattr(run, "url", None),
+    }
+
+
+def public_metric_payload(metric: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metric.items() if not key.startswith("_")}
+
+
+def add_wandb_histograms(metric: dict[str, Any], histograms: dict[str, Any]) -> None:
+    if not histograms:
+        return
+    import wandb
+
+    for name, values in histograms.items():
+        if values is None:
+            continue
+        if hasattr(values, "detach"):
+            values = values.detach().float().cpu().reshape(-1).numpy()
+        if len(values) == 0:
+            continue
+        metric[name] = wandb.Histogram(values)
+
+
+def maybe_log_top_feature_examples(
+    *,
+    wandb_run: Any | None,
+    sae,
+    activation_dir: str | Path,
+    output_root: Path,
+    splits: set[str],
+    token_kinds: set[str],
+    phases: set[str],
+    max_features: int,
+    top_n: int,
+    feature_rank: str,
+    title: str = "Top Activating SAE Features",
+) -> dict[str, Any]:
+    if wandb_run is None or not splits or max_features <= 0 or top_n <= 0:
+        return {}
+    from .visualize import render_feature_report
+
+    feature_ids = list(range(max(0, int(max_features))))
+    feature_ids = feature_ids[: min(len(feature_ids), int(sae.config.feature_dim))]
+    if not feature_ids:
+        return {}
+    records = collect_top_feature_records(
+        activation_dir=activation_dir,
+        sae=sae,
+        feature_ids=feature_ids,
+        top_n=top_n,
+        feature_rank=feature_rank,
+        token_kinds=token_kinds,
+        phases=phases,
+        splits=splits,
+    )
+    if not records:
+        return {}
+    jsonl_path = output_root.with_suffix(".top_features.jsonl")
+    html_path = output_root.with_suffix(".top_features.html")
+    write_jsonl(jsonl_path, records)
+    render_feature_report(jsonl_path, html_path, title=title)
+    table = top_feature_records_table(records)
+    step = getattr(wandb_run, "step", None)
+    wandb_run.log({"top_activating_examples": table}, step=step)
+    artifact = __import__("wandb").Artifact(f"{output_root.stem}_top_features", type="sae_feature_examples")
+    artifact.add_file(str(jsonl_path))
+    artifact.add_file(str(html_path))
+    wandb_run.log_artifact(artifact)
+    wandb_run.summary.update(
+        {
+            "top_feature_examples_logged": len(records),
+            "top_feature_examples_output": str(jsonl_path),
+            "top_feature_report_output": str(html_path),
+            "top_feature_report_splits": ",".join(sorted(splits)),
+            "top_feature_report_top_n": int(top_n),
+            "top_feature_report_max_features": int(len(feature_ids)),
+        }
+    )
+    return {
+        "top_feature_examples_output": str(jsonl_path),
+        "top_feature_report_output": str(html_path),
+        "top_feature_examples_logged": len(records),
+    }
+
+
+def collect_top_feature_records(
+    *,
+    activation_dir: str | Path,
+    sae,
+    feature_ids: list[int],
+    top_n: int,
+    feature_rank: str,
+    token_kinds: set[str],
+    phases: set[str],
+    splits: set[str],
+) -> list[dict[str, Any]]:
+    import heapq
+    import torch
+
+    from .storage import iter_activation_payloads
+
+    device = next(sae.parameters()).device
+    sae.eval()
+    heaps: dict[int, list[tuple[float, int, dict[str, Any]]]] = {feature_id: [] for feature_id in feature_ids}
+    tiebreak = 0
+    for shard_name, payload in iter_activation_payloads(activation_dir):
+        if shard_name == "metadata.pt" or "activations" not in payload:
+            continue
+        meta = payload.get("meta") or {}
+        if splits and activation_split(meta) not in splits:
+            continue
+        acts = payload["activations"].float()
+        token_map = meta.get("token_map") or []
+        with torch.no_grad():
+            features = sae.encode(acts.to(device=device, dtype=torch.float32)).detach().cpu()
+        eligible = [
+            idx
+            for idx in range(features.shape[0])
+            if token_matches_filters(token_info_for_index(token_map, idx), token_kinds=token_kinds, phases=phases)
+        ]
+        if not eligible:
+            continue
+        eligible_idx = torch.tensor(eligible, dtype=torch.long)
+        for feature_id in feature_ids:
+            values = features[eligible_idx, feature_id]
+            scores = values.abs() if feature_rank == "absolute" else values
+            top_scores, top_idx = torch.topk(scores, k=min(top_n, scores.numel()))
+            for score, local_token_idx in zip(top_scores.tolist(), top_idx.tolist()):
+                value = float(values[int(local_token_idx)].item())
+                if feature_rank == "positive" and value <= 0:
+                    continue
+                token_idx = int(eligible_idx[int(local_token_idx)].item())
+                row = {
+                    "feature_id": feature_id,
+                    "activation": value,
+                    "activation_score": float(score),
+                    "token_index": int(token_idx),
+                    "token_info": token_info_for_index(token_map, token_idx),
+                    "record_id": meta.get("id"),
+                    "prompt": meta.get("prompt"),
+                    "media_type": meta.get("media_type"),
+                    "media_path": meta.get("media_path"),
+                    "tags": meta.get("tags", []),
+                    "metadata": meta.get("metadata", {}),
+                    "shard": shard_name,
+                }
+                heap = heaps[feature_id]
+                candidate = (float(score), tiebreak, row)
+                tiebreak += 1
+                if len(heap) < top_n:
+                    heapq.heappush(heap, candidate)
+                else:
+                    heapq.heappushpop(heap, candidate)
+    records: list[dict[str, Any]] = []
+    for feature_id in feature_ids:
+        ranked = sorted(heaps.get(feature_id, []), key=lambda item: (item[0], item[1]), reverse=True)
+        records.extend(row for _score, _index, row in ranked)
+    return records
+
+
+def top_feature_records_table(records: list[dict[str, Any]]) -> Any:
+    import wandb
+
+    columns = [
+        "feature_id",
+        "activation",
+        "activation_score",
+        "record_id",
+        "prompt",
+        "media_type",
+        "media_path",
+        "token_index",
+        "token_phase",
+        "token_kind",
+        "token_role",
+        "tags_json",
+        "metadata_json",
+        "shard",
+    ]
+    table = wandb.Table(columns=columns)
+    for row in records:
+        token = row.get("token_info") or {}
+        table.add_data(
+            int(row.get("feature_id", -1)),
+            float(row.get("activation", 0.0)),
+            float(row.get("activation_score", 0.0)),
+            row.get("record_id"),
+            row.get("prompt"),
+            row.get("media_type"),
+            row.get("media_path"),
+            int(row.get("token_index", -1)),
+            token.get("phase"),
+            token.get("kind"),
+            token.get("role"),
+            json.dumps(row.get("tags", []), ensure_ascii=True),
+            json.dumps(row.get("metadata", {}), ensure_ascii=True, sort_keys=True),
+            row.get("shard"),
+        )
+    return table
+
+
+def flat_numeric_metrics(payload: dict[str, Any], *, prefix: str = "") -> dict[str, float]:
+    flat: dict[str, float] = {}
+    for key, value in payload.items():
+        name = f"{prefix}/{key}" if prefix else key
+        if isinstance(value, bool):
+            flat[name] = float(value)
+        elif isinstance(value, (int, float)):
+            flat[name] = float(value)
+        elif isinstance(value, dict):
+            flat.update(flat_numeric_metrics(value, prefix=name))
+    return flat
+
+
+def cmd_find_features(args: argparse.Namespace) -> int:
+    from .sae import load_sae
+
+    sae = load_sae(str(args.sae))
+    feature_ids = parse_feature_ids(args.feature_ids, sae.config.feature_dim)
+    records = collect_top_feature_records(
+        activation_dir=args.activation_dir,
+        sae=sae,
+        feature_ids=feature_ids,
+        top_n=args.top_n,
+        feature_rank=args.feature_rank,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=set(),
+    )
+    write_jsonl(args.output, records)
+    print(json.dumps({"output": str(args.output), "num_records": len(records)}, indent=2))
+    return 0
+
+
+def cmd_analyze_sae(args: argparse.Namespace) -> int:
+    import torch
+
+    from .sae import load_sae
+
+    data = load_activation_dataset(
+        args.activation_dir,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=parse_kind_filter(args.splits),
+    )
+    if data.activations is None:
+        raise ValueError(f"no activation shards found in {args.activation_dir}")
+    sae = load_sae(str(args.sae))
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    sae = sae.to(device)
+    sae.eval()
+    acts = data.activations
+    feature_dim = sae.config.feature_dim
+    fire_counts = torch.zeros(feature_dim, dtype=torch.long)
+    positive_counts = torch.zeros(feature_dim, dtype=torch.long)
+    negative_counts = torch.zeros(feature_dim, dtype=torch.long)
+    activation_abs_sum = torch.zeros(feature_dim, dtype=torch.float64)
+    activation_sum = torch.zeros(feature_dim, dtype=torch.float64)
+    batch_size = max(1, int(args.batch_size))
+    for start in range(0, acts.shape[0], batch_size):
+        batch = acts[start : start + batch_size].to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            features = sae.encode(batch).detach().cpu()
+        active = features != 0
+        fire_counts += active.sum(dim=0).to(dtype=torch.long)
+        positive_counts += (features > 0).sum(dim=0).to(dtype=torch.long)
+        negative_counts += (features < 0).sum(dim=0).to(dtype=torch.long)
+        activation_abs_sum += features.abs().sum(dim=0).to(dtype=torch.float64)
+        activation_sum += features.sum(dim=0).to(dtype=torch.float64)
+    num_tokens = int(acts.shape[0])
+    fire_rate = fire_counts.to(dtype=torch.float64) / max(1, num_tokens)
+    live_mask = fire_counts > 0
+    per_feature_path = args.output.with_suffix(".features.jsonl")
+    per_feature_records = []
+    for feature_id in range(feature_dim):
+        count = int(fire_counts[feature_id].item())
+        per_feature_records.append(
+            {
+                "feature_id": feature_id,
+                "fire_count": count,
+                "fire_rate": float(fire_rate[feature_id].item()),
+                "positive_count": int(positive_counts[feature_id].item()),
+                "negative_count": int(negative_counts[feature_id].item()),
+                "mean_activation": float(activation_sum[feature_id].item() / max(1, num_tokens)),
+                "mean_abs_activation": float(activation_abs_sum[feature_id].item() / max(1, num_tokens)),
+                "mean_abs_activation_when_active": float(activation_abs_sum[feature_id].item() / max(1, count)),
+            }
+        )
+    summary = feature_frequency_summary(
+        fire_counts=fire_counts,
+        fire_rate=fire_rate,
+        num_tokens=num_tokens,
+        data=data,
+        sae=sae,
+        activation_dir=str(args.activation_dir),
+        sae_path=str(args.sae),
+        filters={"token_kinds": args.token_kinds, "phases": args.phases, "splits": args.splits},
+        per_feature_path=str(per_feature_path),
+    )
+    wandb_run = init_basic_wandb_run(
+        args,
+        job_type="analyze_sae",
+        config={
+            "activation_dir": str(args.activation_dir),
+            "sae": str(args.sae),
+            "output": str(args.output),
+            "batch_size": args.batch_size,
+            "device": args.device,
+            "token_kinds": args.token_kinds,
+            "phases": args.phases,
+            "splits": args.splits,
+        },
+    )
+    if wandb_run is not None:
+        analysis_metric = {f"analysis/{key}": value for key, value in flat_numeric_metrics(summary).items()}
+        mean_abs_when_active = activation_abs_sum / fire_counts.clamp_min(1).to(dtype=torch.float64)
+        add_wandb_histograms(
+            analysis_metric,
+            {
+                "hist/full_feature_fire_rate": fire_rate.float(),
+                "hist/full_feature_fire_count": fire_counts.float(),
+                "hist/full_feature_mean_abs_activation_when_active": mean_abs_when_active.float(),
+            },
+        )
+        wandb_run.log(analysis_metric)
+        wandb_run.summary.update({key: value for key, value in flat_numeric_metrics(summary).items()})
+        wandb_run.finish()
+    ensure_dir(args.output.parent)
+    args.output.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    write_jsonl(per_feature_path, per_feature_records)
+    print(json.dumps({"output": str(args.output), "per_feature_output": str(per_feature_path), **summary}, indent=2))
+    return 0
+
+
+def cmd_decompose_activations(args: argparse.Namespace) -> int:
+    from .decompose import fit_ica, fit_pca, save_basis
+
+    data = load_activation_dataset(
+        args.activation_dir,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=parse_kind_filter(args.splits),
+        stream=args.stream or None,
+    )
+    if data.activations is None:
+        raise ValueError(f"no activation shards found in {args.activation_dir}")
+
+    if args.method == "pca":
+        basis, stats = fit_pca(data.activations, n_components=args.n_components, batch_size=args.batch_size, whiten=args.whiten)
+    else:
+        basis, stats = fit_ica(
+            data.activations, n_components=args.n_components, seed=args.seed, max_samples=args.max_samples, batch_size=args.batch_size
+        )
+
+    summary = {
+        "activation_dir": str(args.activation_dir),
+        "basis": str(args.output),
+        "filters": {"token_kinds": args.token_kinds, "phases": args.phases, "splits": args.splits, "stream": args.stream},
+        **stats,
+    }
+    wandb_run = init_basic_wandb_run(
+        args,
+        job_type="decompose_activations",
+        config={"activation_dir": str(args.activation_dir), "output": str(args.output), "method": args.method, "n_components": args.n_components},
+    )
+    if wandb_run is not None:
+        wandb_run.summary.update(flat_numeric_metrics({k: v for k, v in stats.items() if k != "explained_variance_ratio"}))
+        wandb_run.finish()
+    save_basis(str(args.output), basis, stats=stats, metadata=wandb_run_metadata(wandb_run))
+    summary_path = args.output.with_suffix(".summary.json")
+    ensure_dir(summary_path.parent)
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    print(json.dumps({"output": str(args.output), "summary_output": str(summary_path), **summary}, indent=2))
+    return 0
+
+
+def cmd_find_components(args: argparse.Namespace) -> int:
+    from .decompose import load_basis
+
+    basis = load_basis(str(args.basis))
+    component_ids = parse_feature_ids(args.component_ids, basis.config.feature_dim)
+    records = collect_top_feature_records(
+        activation_dir=args.activation_dir,
+        sae=basis,
+        feature_ids=component_ids,
+        top_n=args.top_n,
+        feature_rank=args.feature_rank,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=set(),
+    )
+    write_jsonl(args.output, records)
+    print(json.dumps({"output": str(args.output), "num_records": len(records)}, indent=2))
+    return 0
+
+
+def _probe_label_source(args: argparse.Namespace) -> str:
+    if args.label_tag is not None:
+        return f"tag:{args.label_tag}"
+    if args.label_key is not None:
+        return f"metadata:{args.label_key}"
+    return f"field:{args.label_field}"
+
+
+def _probe_config(args: argparse.Namespace, *, penalty: str):
+    from .linear_probe import LinearProbeConfig
+
+    return LinearProbeConfig(
+        aggregation=args.aggregation,
+        penalty=penalty,
+        max_train=args.max_train,
+        test_frac=args.test_frac,
+        standardize=args.standardize,
+        seed=args.seed,
+    )
+
+
+def _load_probe_inputs(args: argparse.Namespace):
+    """Shared probe-command setup: (records, label_map, data) joined by record id."""
+    from .linear_probe import build_label_map
+
+    records = list(iter_manifest(args.manifest))
+    label_map = build_label_map(
+        records,
+        label_tag=args.label_tag,
+        label_key=args.label_key,
+        label_field=args.label_field,
+    )
+    data = load_activation_dataset(
+        args.activation_dir,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=parse_kind_filter(args.splits),
+        stream=args.stream or None,
+    )
+    if data.activations is None:
+        raise ValueError(f"no activation shards found in {args.activation_dir}")
+    return records, label_map, data
+
+
+def _write_summary(path: Path, summary: dict[str, Any]) -> None:
+    ensure_dir(path.parent)
+    path.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+
+
+def cmd_train_linear_probe(args: argparse.Namespace) -> int:
+    from .linear_probe import assemble_probe_matrix, fit_probe
+
+    config = _probe_config(args, penalty=args.penalty)
+    records, label_map, data = _load_probe_inputs(args)
+    X, y, record_ids = assemble_probe_matrix(data, label_map, config)
+    result = fit_probe(X, y, config)
+
+    summary = {
+        "activation_dir": str(args.activation_dir),
+        "manifest": str(args.manifest),
+        "label_source": _probe_label_source(args),
+        "aggregation": args.aggregation,
+        "n_manifest_records": len(records),
+        "n_labeled_records": len(label_map),
+        "n_probed_records": len(record_ids),
+        "result": result.to_dict(),
+    }
+    _write_summary(args.output, summary)
+    return 0
+
+
+def cmd_compare_sae_probe(args: argparse.Namespace) -> int:
+    from .linear_probe import assemble_probe_matrix, assemble_sae_feature_matrix, fit_probe
+    from .sae import load_sae
+
+    k_values = [int(v) for v in args.k_values.split(",") if v.strip()]
+    if not k_values:
+        raise ValueError("--k-values must list at least one integer")
+
+    base_config = _probe_config(args, penalty=args.penalty)
+    sae_config = _probe_config(args, penalty=args.sae_penalty)
+    records, label_map, data = _load_probe_inputs(args)
+    sae = load_sae(str(args.sae), map_location=args.device or "cpu")
+
+    # Aligned matrices over the same records → identical train/test split (same seed + label order).
+    raw_X, y, record_ids = assemble_probe_matrix(data, label_map, base_config)
+    sae_X, _, _ = assemble_sae_feature_matrix(data, sae, label_map, sae_config, batch_size=args.batch_size)
+
+    baseline = fit_probe(raw_X, y, base_config)
+    baseline_auc = baseline.test_auc
+    sae_results = []
+    for k in k_values:
+        result = fit_probe(sae_X, y, sae_config, select_top_k=k)
+        sae_results.append(
+            {
+                "k": k,
+                "auc_delta": result.test_auc - baseline_auc,
+                "sae_wins": result.test_auc > baseline_auc,
+                "result": result.to_dict(),
+            }
+        )
+
+    best_sae = max(sae_results, key=lambda r: r["result"]["test_auc"])
+    summary = {
+        "activation_dir": str(args.activation_dir),
+        "manifest": str(args.manifest),
+        "sae": str(args.sae),
+        "label_source": _probe_label_source(args),
+        "aggregation": args.aggregation,
+        "feature_dim": int(sae.config.feature_dim),
+        "n_probed_records": len(record_ids),
+        "baseline": baseline.to_dict(),
+        "sae_probes": sae_results,
+        "best_sae_auc": best_sae["result"]["test_auc"],
+        "best_sae_k": best_sae["k"],
+        "sae_beats_baseline": best_sae["result"]["test_auc"] > baseline_auc,
+    }
+
+    # Optional unsupervised-direction baseline (PCA/ICA), on the same records + split.
+    if args.decomp_basis is not None:
+        from .decompose import load_basis
+
+        basis = load_basis(str(args.decomp_basis), map_location=args.device or "cpu")
+        decomp_X, _, _ = assemble_sae_feature_matrix(data, basis, label_map, sae_config, batch_size=args.batch_size)
+        decomp_results = []
+        for k in k_values:
+            # select_top_k_features already clamps k to the component count, so pass the requested
+            # k unchanged — matching the SAE branch's labelling and avoiding duplicate fits.
+            result = fit_probe(decomp_X, y, sae_config, select_top_k=k)
+            decomp_results.append(
+                {
+                    "k": k,
+                    "auc_delta": result.test_auc - baseline_auc,
+                    "decomp_wins": result.test_auc > baseline_auc,
+                    "result": result.to_dict(),
+                }
+            )
+        best_decomp = max(decomp_results, key=lambda r: r["result"]["test_auc"])
+        summary.update(
+            {
+                "decomp_basis": str(args.decomp_basis),
+                "decomp_method": basis.config.method,
+                "decomp_n_components": int(basis.config.feature_dim),
+                "decomp_probes": decomp_results,
+                "best_decomp_auc": best_decomp["result"]["test_auc"],
+                "best_decomp_k": best_decomp["k"],
+                "decomp_beats_baseline": best_decomp["result"]["test_auc"] > baseline_auc,
+            }
+        )
+
+    _write_summary(args.output, summary)
+    return 0
+
+
+def feature_frequency_summary(
+    *,
+    fire_counts,
+    fire_rate,
+    num_tokens: int,
+    data: ActivationDataset,
+    sae,
+    activation_dir: str,
+    sae_path: str,
+    filters: dict[str, str],
+    per_feature_path: str,
+) -> dict[str, Any]:
+    import torch
+
+    feature_dim = int(fire_counts.numel())
+    live_mask = fire_counts > 0
+    sorted_rates, sorted_idx = torch.sort(fire_rate)
+    quantiles = {}
+    if feature_dim:
+        for label, q in [("p00", 0.0), ("p01", 0.01), ("p05", 0.05), ("p10", 0.10), ("p50", 0.50), ("p90", 0.90), ("p99", 0.99), ("p100", 1.0)]:
+            index = min(feature_dim - 1, max(0, int(round(q * (feature_dim - 1)))))
+            quantiles[label] = float(sorted_rates[index].item())
+    fire_count_thresholds = {
+        "ge_1": fire_counts >= 1,
+        "ge_2": fire_counts >= 2,
+        "ge_10": fire_counts >= 10,
+    }
+    fire_rate_thresholds = {
+        "ge_1e_6": fire_rate >= 1e-6,
+        "ge_1e_5": fire_rate >= 1e-5,
+        "ge_1e_4": fire_rate >= 1e-4,
+        "ge_1e_3": fire_rate >= 1e-3,
+        "ge_1e_2": fire_rate >= 1e-2,
+    }
+    usage_thresholds = {
+        label: {
+            "count": int(mask.sum().item()),
+            "frac": float(mask.to(dtype=torch.float32).mean().item()) if feature_dim else 0.0,
+        }
+        for label, mask in {**fire_count_thresholds, **fire_rate_thresholds}.items()
+    }
+    lowest_live = [
+        {"feature_id": int(idx.item()), "fire_count": int(fire_counts[idx].item()), "fire_rate": float(fire_rate[idx].item())}
+        for idx in sorted_idx[live_mask[sorted_idx]][:20]
+    ]
+    highest = [
+        {"feature_id": int(idx), "fire_count": int(fire_counts[idx].item()), "fire_rate": float(fire_rate[idx].item())}
+        for idx in reversed(sorted_idx[-20:].tolist())
+    ]
+    return {
+        "activation_dir": activation_dir,
+        "sae": sae_path,
+        "filters": filters,
+        "num_tokens": num_tokens,
+        "input_dim": int(sae.config.input_dim),
+        "feature_dim": feature_dim,
+        "expansion_factor": int(sae.config.expansion_factor),
+        "top_k": int(sae.config.top_k),
+        "topk_activation": sae.config.topk_activation,
+        "init_method": sae.config.init_method,
+        "input_scale": float(sae.config.input_scale),
+        "live_features": int(live_mask.sum().item()),
+        "live_feature_frac": float(live_mask.to(dtype=torch.float32).mean().item()) if feature_dim else 0.0,
+        "dead_features": int((~live_mask).sum().item()),
+        "dead_feature_frac": float((~live_mask).to(dtype=torch.float32).mean().item()) if feature_dim else 0.0,
+        "mean_fire_rate": float(fire_rate.mean().item()) if feature_dim else 0.0,
+        "fire_rate_quantiles": quantiles,
+        "feature_usage_thresholds": usage_thresholds,
+        "lowest_live_features": lowest_live,
+        "highest_fire_rate_features": highest,
+        "group_counts": data.group_counts,
+        "per_feature_output": per_feature_path,
+    }
+
+
+def compact_activation_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in meta.items() if key != "token_map"}
+
+
+def activation_sidecar_name(shard_name: str) -> str:
+    return f"metadata/{shard_name}.json"
+
+
+def activation_worker_metadata_name(*, worker_index: int, num_workers: int) -> str:
+    validate_worker_partition(worker_index=worker_index, num_workers=num_workers)
+    if num_workers == 1:
+        return "metadata.jsonl"
+    return f"metadata/worker_{worker_index:03d}.jsonl"
+
+
+def activation_record_assigned(index: int, *, worker_index: int, num_workers: int) -> bool:
+    validate_worker_partition(worker_index=worker_index, num_workers=num_workers)
+    return index % num_workers == worker_index
+
+
+def validate_worker_partition(*, worker_index: int, num_workers: int) -> None:
+    if num_workers < 1:
+        raise ValueError("--num-workers must be at least 1")
+    if worker_index < 0 or worker_index >= num_workers:
+        raise ValueError("--worker-index must be in [0, --num-workers)")
+
+
+def token_info_for_index(token_map: list[dict[str, Any]], token_index: int) -> dict[str, Any] | None:
+    if 0 <= token_index < len(token_map):
+        return token_map[token_index]
+    return None
+
+
+def load_activation_examples(path: str | Path, *, max_tokens: int, seed: int) -> tuple[list[dict[str, Any]], torch.Tensor]:
+    import torch
+    from .storage import iter_activation_payloads
+
+    if max_tokens <= 1:
+        raise ValueError("--max-tokens must be greater than 1")
+    rng = random.Random(seed)
+    examples: list[dict[str, Any]] = []
+    vectors: list[torch.Tensor] = []
+    seen = 0
+    for shard_name, payload in iter_activation_payloads(path):
+        if "activations" not in payload:
+            continue
+        activations = payload["activations"].float()
+        acts = activations.reshape(-1, activations.shape[-1])
+        meta = payload.get("meta", {})
+        token_map = meta.get("token_map") or []
+        for token_index in range(acts.shape[0]):
+            seen += 1
+            replacement = len(examples) if len(examples) < max_tokens else rng.randrange(seen)
+            if replacement >= max_tokens:
+                continue
+            example = activation_example(meta, shard_name, token_map, token_index)
+            vector = acts[token_index].detach().clone()
+            if replacement == len(examples):
+                examples.append(example)
+                vectors.append(vector)
+            else:
+                examples[replacement] = example
+                vectors[replacement] = vector
+    if not vectors:
+        raise ValueError(f"no activation shards found in {path}")
+    return examples, torch.stack(vectors, dim=0)
+
+
+def activation_example(meta: dict[str, Any], shard: str, token_map: list[dict[str, Any]], token_index: int) -> dict[str, Any]:
+    return {
+        "record_id": meta.get("id"),
+        "prompt": meta.get("prompt"),
+        "media_type": meta.get("media_type"),
+        "media_path": meta.get("media_path"),
+        "tags": meta.get("tags", []),
+        "metadata": meta.get("metadata", {}),
+        "shard": shard,
+        "token_index": int(token_index),
+        "token_info": token_info_for_index(token_map, token_index),
+    }
+
+
+def parse_kind_filter(value: str) -> set[str]:
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def cmd_render_feature_report(args: argparse.Namespace) -> int:
+    from .visualize import render_feature_report
+
+    render_feature_report(args.features, args.output, title=args.title)
+    print(json.dumps({"output": str(args.output)}, indent=2))
+    return 0
+
+
+def cmd_find_neighbors(args: argparse.Namespace) -> int:
+    import torch
+
+    examples, matrix = load_activation_examples(args.activation_dir, max_tokens=args.max_tokens, seed=args.seed)
+    if len(examples) < 2:
+        raise ValueError(f"need at least 2 activation tokens, found {len(examples)}")
+    allowed_kinds = parse_kind_filter(args.query_kinds)
+    query_candidates = [
+        idx for idx, example in enumerate(examples) if not allowed_kinds or (example.get("token_info") or {}).get("kind") in allowed_kinds
+    ]
+    if not query_candidates:
+        raise ValueError(f"no query tokens matched kinds={sorted(allowed_kinds)}")
+    rng = random.Random(args.seed)
+    rng.shuffle(query_candidates)
+    query_indices = query_candidates[: min(args.num_queries, len(query_candidates))]
+    normalized = torch.nn.functional.normalize(matrix.float(), dim=1)
+    records: list[dict[str, Any]] = []
+    for query_index in query_indices:
+        sims = normalized @ normalized[query_index]
+        top_values, top_indices = torch.topk(sims, k=min(args.neighbors + 1, sims.numel()))
+        neighbors = []
+        for value, neighbor_index in zip(top_values.tolist(), top_indices.tolist()):
+            neighbor_index = int(neighbor_index)
+            if neighbor_index == query_index:
+                continue
+            neighbors.append({**examples[neighbor_index], "similarity": float(value)})
+            if len(neighbors) >= args.neighbors:
+                break
+        records.append({"query": examples[query_index], "neighbors": neighbors})
+    write_jsonl(args.output, records)
+    print(json.dumps({"output": str(args.output), "num_queries": len(records), "sampled_tokens": len(examples)}, indent=2))
+    return 0
+
+
+def cmd_render_neighbor_report(args: argparse.Namespace) -> int:
+    from .visualize import render_neighbor_report
+
+    render_neighbor_report(args.neighbors, args.output, title=args.title)
+    print(json.dumps({"output": str(args.output)}, indent=2))
+    return 0
+
+
+def cmd_steer(args: argparse.Namespace) -> int:
+    from .runtime import CosmosReasonerRuntime
+    from .runtime.hooks import FeatureSteeringHook
+    from .sae import load_sae
+
+    record = load_steering_record(args)
+    if record is None and not args.prompt:
+        raise ValueError("steer requires either --prompt or --manifest")
+    if record is None and (parse_kind_filter(args.steer_token_kinds) or parse_kind_filter(args.steer_roles)):
+        raise ValueError("--steer-token-kinds/--steer-roles require --manifest so token maps can be built")
+    runtime = CosmosReasonerRuntime(
+        args.model_id,
+        device=args.device,
+        dtype=args.dtype,
+        init_mode=args.init_mode,
+    ).load()
+    sae = load_sae(str(args.sae), map_location="cpu")
+    if record is None:
+        baseline: Any = runtime.generate(
+            prompt=args.prompt,
+            max_new_tokens=args.max_new_tokens,
+            prompt_format=args.prompt_format,
+            system_prompt=args.system_prompt,
+        )
+    else:
+        baseline = runtime.generate_for_record(
+            record,
+            max_new_tokens=args.max_new_tokens,
+            prompt_format=args.prompt_format,
+            system_prompt=args.system_prompt,
+        )
+    hook = FeatureSteeringHook(
+        sae=sae,
+        feature_id=args.feature_id,
+        multiplier=args.multiplier,
+        scope=args.scope,
+        token_kinds=frozenset(parse_kind_filter(args.steer_token_kinds)),
+        roles=frozenset(parse_kind_filter(args.steer_roles)),
+    )
+    if record is None:
+        steered: Any = runtime.generate(
+            prompt=args.prompt,
+            layer=args.layer,
+            edit_fn=hook,
+            max_new_tokens=args.max_new_tokens,
+            prompt_format=args.prompt_format,
+            system_prompt=args.system_prompt,
+        )
+    else:
+        steered = runtime.generate_for_record(
+            record,
+            layer=args.layer,
+            edit_fn=hook,
+            max_new_tokens=args.max_new_tokens,
+            prompt_format=args.prompt_format,
+            system_prompt=args.system_prompt,
+        )
+    result = {
+        "prompt": args.prompt,
+        "record_id": record.id if record is not None else None,
+        "media_type": record.media_type if record is not None else None,
+        "media_path": record.media_path if record is not None else None,
+        "layer": args.layer,
+        "feature_id": args.feature_id,
+        "multiplier": args.multiplier,
+        "scope": args.scope,
+        "steer_token_kinds": sorted(parse_kind_filter(args.steer_token_kinds)),
+        "steer_roles": sorted(parse_kind_filter(args.steer_roles)),
+        "prompt_format": args.prompt_format,
+        "system_prompt": args.system_prompt,
+        "baseline": baseline,
+        "steered": steered,
+    }
+    ensure_dir(args.output.parent)
+    args.output.write_text(json.dumps(result, indent=2, ensure_ascii=True), encoding="utf-8")
+    print(json.dumps({"output": str(args.output)}, indent=2))
+    return 0
+
+
+def load_steering_record(args: argparse.Namespace):
+    if args.manifest is None:
+        return None
+    for record in iter_manifest(args.manifest):
+        if args.record_id is None or record.id == args.record_id:
+            return record
+    raise ValueError(f"record id {args.record_id!r} not found in {args.manifest}")
+
+
+@dataclass(frozen=True)
+class ActivationDataset:
+    activations: Any | None
+    token_groups: list[tuple[str, ...]]
+    group_counts: dict[str, int]
+    # Parallel to the activation rows: spatiotemporal provenance of each token (record id,
+    # token index, kind, and visual (frame, patch_y, patch_x) + merged grid dims when visual).
+    # Empty visual fields for non-visual tokens. Enables reshaping features back to (T, H, W).
+    token_coords: list[dict[str, Any]] = field(default_factory=list)
+
+
+def load_activation_matrix(
+    path: str | Path,
+    *,
+    token_kinds: set[str] | None = None,
+    phases: set[str] | None = None,
+    splits: set[str] | None = None,
+    allow_empty: bool = False,
+) -> torch.Tensor | None:
+    return load_activation_dataset(
+        path,
+        token_kinds=token_kinds,
+        phases=phases,
+        splits=splits,
+        allow_empty=allow_empty,
+    ).activations
+
+
+def load_activation_dataset(
+    path: str | Path,
+    *,
+    token_kinds: set[str] | None = None,
+    phases: set[str] | None = None,
+    splits: set[str] | None = None,
+    stream: str | None = None,
+    allow_empty: bool = False,
+) -> ActivationDataset:
+    import torch
+    from .storage import iter_activation_payloads
+
+    shards = []
+    token_group_rows: list[tuple[str, ...]] = []
+    token_coord_rows: list[dict[str, Any]] = []
+    token_kinds = token_kinds or set()
+    phases = phases or set()
+    splits = splits or set()
+    for _shard_name, payload in iter_activation_payloads(path):
+        if "activations" in payload:
+            meta = payload.get("meta") or {}
+            if splits and activation_split(meta) not in splits:
+                continue
+            acts = payload["activations"].reshape(-1, payload["activations"].shape[-1])
+            token_map = meta.get("token_map") or []
+            keep = list(range(acts.shape[0]))
+            if token_kinds or phases or stream:
+                keep = [
+                    idx
+                    for idx in range(acts.shape[0])
+                    if token_matches_filters(
+                        token_info_for_index(token_map, idx), token_kinds=token_kinds, phases=phases, stream=stream
+                    )
+                ]
+                if not keep:
+                    continue
+                acts = acts[torch.tensor(keep, dtype=torch.long)]
+            shards.append(acts)
+            kept_infos = [token_info_for_index(token_map, idx) for idx in keep]
+            token_group_rows.extend(token_metric_groups(info) for info in kept_infos)
+            token_coord_rows.extend(token_row_coords(meta, info) for info in kept_infos)
+    if not shards:
+        if allow_empty:
+            return ActivationDataset(activations=None, token_groups=[], group_counts={}, token_coords=[])
+        raise ValueError(f"no activation shards found in {path}")
+    # Guard against silently pooling two residual streams into one SAE (Mixture-of-Transformers):
+    # AR-routed and diffusion-routed tokens have different parameters and statistics. If a load
+    # spans more than one stream, the caller must pick one via stream=...
+    streams = {coord.get("stream") for coord in token_coord_rows}
+    if len(streams) > 1:
+        raise ValueError(
+            f"activation set mixes residual streams {sorted(map(str, streams))}; "
+            "train per-stream SAEs and select one with stream=..."
+        )
+    return ActivationDataset(
+        activations=torch.cat(shards, dim=0),
+        token_groups=token_group_rows,
+        group_counts=count_group_memberships(token_group_rows),
+        token_coords=token_coord_rows,
+    )
+
+
+def feature_activation_maps(
+    data: ActivationDataset,
+    sae: Any,
+    feature_id: int,
+    *,
+    records: set[str] | None = None,
+    batch_size: int = 4096,
+    fill: float = 0.0,
+) -> dict[str, Any]:
+    """Per-record (T, H, W) maps of one SAE feature's activation over visual tokens.
+
+    Encodes the dataset's activations with ``sae``, takes the chosen feature column, and scatters
+    each visual row's value into its record's (frame, patch_y, patch_x) grid cell. Images come back
+    as T=1; video as T=num_frames. Non-visual rows are ignored. Records with no visual tokens (and,
+    when ``records`` is given, records outside the set) are omitted.
+    """
+    import torch
+
+    if data.activations is None or not data.token_coords:
+        return {}
+    if feature_id < 0 or feature_id >= int(sae.config.feature_dim):
+        raise IndexError(f"feature_id={feature_id} outside [0, {int(sae.config.feature_dim)})")
+
+    # Group visual rows by record (a row is visual iff it has a full grid position).
+    rows_by_record: dict[str, list[int]] = {}
+    for row, coord in enumerate(data.token_coords):
+        if coord.get("frame") is None or coord.get("patch_y") is None or coord.get("patch_x") is None:
+            continue
+        record = coord.get("record")
+        if records is not None and record not in records:
+            continue
+        rows_by_record.setdefault(record, []).append(row)
+    if not rows_by_record:
+        return {}
+
+    # Encode only the rows we need, in batches, and read off the feature column.
+    needed = sorted({row for rows in rows_by_record.values() for row in rows})
+    device = next(sae.parameters()).device
+    column: dict[int, float] = {}
+    sae.eval()
+    with torch.no_grad():
+        for start in range(0, len(needed), batch_size):
+            batch_rows = needed[start : start + batch_size]
+            chunk = data.activations[torch.tensor(batch_rows, dtype=torch.long)].to(device=device, dtype=torch.float32)
+            feats = sae.encode(chunk)[:, feature_id].detach().to("cpu", torch.float32)
+            for row, value in zip(batch_rows, feats.tolist()):
+                column[row] = value
+
+    maps: dict[str, Any] = {}
+    for record, rows in rows_by_record.items():
+        coords = [data.token_coords[row] for row in rows]
+        t_dim = _grid_extent(coords, "grid_t", "frame")
+        h_dim = _grid_extent(coords, "grid_h", "patch_y")
+        w_dim = _grid_extent(coords, "grid_w", "patch_x")
+        grid = torch.full((t_dim, h_dim, w_dim), float(fill), dtype=torch.float32)
+        for row, coord in zip(rows, coords):
+            frame, patch_y, patch_x = int(coord["frame"]), int(coord["patch_y"]), int(coord["patch_x"])
+            if 0 <= frame < t_dim and 0 <= patch_y < h_dim and 0 <= patch_x < w_dim:
+                grid[frame, patch_y, patch_x] = column[row]
+        maps[record] = grid
+    return maps
+
+
+def _grid_extent(coords: list[dict[str, Any]], dim_key: str, index_key: str) -> int:
+    """Grid size along one axis: prefer the stored merged-grid dim, else max observed index + 1."""
+    dims = [int(c[dim_key]) for c in coords if c.get(dim_key) is not None]
+    if dims:
+        return max(dims)
+    return max(int(c[index_key]) for c in coords) + 1
+
+
+def activation_split(meta: dict[str, Any]) -> str:
+    metadata = meta.get("metadata") or {}
+    return str(metadata.get("split") or "sae_train")
+
+
+def token_matches_filters(token: dict[str, Any] | None, *, token_kinds: set[str], phases: set[str], stream: str | None = None) -> bool:
+    token = token or {}
+    if token_kinds and token.get("kind") not in token_kinds:
+        return False
+    if phases and token.get("phase") not in phases:
+        return False
+    if stream and (token.get("stream") or "ar") != stream:
+        return False
+    return True
+
+
+def token_row_coords(meta: dict[str, Any], token: dict[str, Any] | None) -> dict[str, Any]:
+    """Spatiotemporal provenance for one activation row, aligned to its training-tensor index.
+
+    Carries the record id, the token's index within that record, its kind, and — for visual
+    tokens — the (frame, patch_y, patch_x) grid position plus the record's merged (t, h, w)
+    grid dimensions, so feature activations can be scattered back into per-record (T, H, W) maps.
+    """
+    token = token or {}
+    position = token.get("visual_position") or {}
+    merged = (meta.get("visual_grid") or {}).get("merged_grid_thw") or []
+    return {
+        "record": meta.get("id"),
+        "index": token.get("index"),
+        "kind": token.get("kind"),
+        # Residual stream (Mixture-of-Transformers): "ar" for understanding/AR tokens. Shards
+        # collected before the tag existed are AR-only, so default to "ar" rather than None.
+        "stream": token.get("stream") or "ar",
+        "frame": position.get("frame"),
+        "patch_y": position.get("patch_y"),
+        "patch_x": position.get("patch_x"),
+        "grid_t": merged[0] if len(merged) > 0 else None,
+        "grid_h": merged[1] if len(merged) > 1 else None,
+        "grid_w": merged[2] if len(merged) > 2 else None,
+    }
+
+
+def token_metric_groups(token: dict[str, Any] | None) -> tuple[str, ...]:
+    token = token or {}
+    kind = str(token.get("kind") or "unknown")
+    phase = str(token.get("phase") or "unknown")
+    role = str(token.get("role") or "unknown")
+    groups = {
+        "all",
+        f"kind:{kind}",
+        f"phase:{phase}",
+        f"phase_kind:{phase}:{kind}",
+    }
+    if role != "unknown":
+        groups.add(f"role:{role}")
+        groups.add(f"role_kind:{role}:{kind}")
+    if kind in {"image", "video"}:
+        groups.add("media")
+        groups.add(f"media:{kind}")
+    if kind == "special":
+        groups.add("special")
+    return tuple(sorted(groups))
+
+
+def count_group_memberships(rows: list[tuple[str, ...]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for groups in rows:
+        for group in groups:
+            counts[group] = counts.get(group, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def shard_path_for_record(output_dir: Path, idx: int, record_id: str) -> Path:
+    return output_dir / shard_name_for_record(idx, record_id)
+
+
+def shard_name_for_record(idx: int, record_id: str) -> str:
+    leaf = record_id.rstrip("/").rsplit("/", 1)[-1] or record_id
+    stem = Path(leaf).stem or leaf
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in stem).strip("._")
+    safe_stem = (safe_stem or "record")[:80]
+    digest = hashlib.sha1(record_id.encode("utf-8")).hexdigest()[:10]
+    return f"{idx:06d}_{safe_stem}_{digest}.pt"
+
+
+def parse_feature_ids(raw: str, feature_dim: int) -> list[int]:
+    if not raw:
+        return list(range(min(feature_dim, 128)))
+    out = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        value = int(item)
+        if value < 0 or value >= feature_dim:
+            raise ValueError(f"feature id {value} outside [0, {feature_dim})")
+        out.append(value)
+    return out

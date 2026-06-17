@@ -1,0 +1,1 @@
+According to the paper, the dataset used for the Reasoner pre-training was mostly sourced from Nemotron Nano https://huggingface.co/datasets/nvidia/Nemotron-VLM-Dataset-v2, I should look into using it for the SAE. 

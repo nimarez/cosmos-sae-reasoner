@@ -1,0 +1,29 @@
+[project]
+name = "cosmos-research-tools"
+version = "0.1.0"
+description = "Local research utilities for Cosmos cookbooks and SAE experiments."
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+sae = [
+  "accelerate",
+  "boto3",
+  "datasets",
+  "huggingface-hub",
+  "imageio",
+  "numpy",
+  "opencv-python-headless",
+  "pillow",
+  "qwen-vl-utils",
+  "safetensors",
+  "scikit-learn>=1.8",
+  "streamlit",
+  "torch",
+  "torchvision",
+  "transformers>=4.57.0",
+]
+sae-test = [
+  {include-group = "sae"},
+  "pytest",
+]
