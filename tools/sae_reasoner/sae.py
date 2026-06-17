@@ -571,6 +571,8 @@ def train_sae_from_tensor(
                     "lr": float(step_lr),
                     "activation_norm": 1.0 if activation_norm == "sqrt_d" else 0.0,
                     "input_scale": float(input_scale),
+                    # tokens_seen = cumulative batch rows processed (re-counts rows across epochs);
+                    # new_tokens_seen = distinct dataset rows drawn at least once (see data_coverage).
                     "tokens_seen": float(step * sampler.batch_size),
                     "epoch": float(sampler.fractional_epoch()),
                     "new_tokens_seen": float(int(seen_mask.sum().item())),
@@ -875,6 +877,8 @@ def validation_metrics(
     sample_n = min(max(1, batch_size), n)
     device = next(sae.parameters()).device
     if sample_n < n:
+        # Validation is a one-shot metric estimate, so with-replacement sampling is fine here;
+        # only training uses the without-replacement ShuffledEpochSampler.
         idx = torch.randint(0, n, (sample_n,), device=validation_activations.device)
         batch = validation_activations.index_select(0, idx).to(device=device, dtype=torch.float32)
         sampled_group_masks = {label: mask.index_select(0, idx).to(device=device) for label, mask in (group_masks or {}).items()}

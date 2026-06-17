@@ -231,9 +231,45 @@ def s3_client():
         import boto3
     except Exception as exc:  # pragma: no cover - depends on optional env
         raise RuntimeError("S3 access requires boto3. Install the sae dependency group.") from exc
-    endpoint_url = os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
-    kwargs = {"endpoint_url": endpoint_url} if endpoint_url else {}
-    return boto3.client("s3", **kwargs)
+    return boto3.client("s3", **s3_client_kwargs())
+
+
+def s3_client_kwargs() -> dict[str, str]:
+    endpoint_url = s3_endpoint_url()
+    kwargs: dict[str, str] = {}
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+
+    access_key = os.environ.get("R2_ACCESS_KEY_ID")
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY")
+    if access_key and secret_key:
+        kwargs["aws_access_key_id"] = access_key
+        kwargs["aws_secret_access_key"] = secret_key
+
+    region = (
+        os.environ.get("R2_REGION")
+        or os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or ("auto" if endpoint_url and ".r2.cloudflarestorage.com" in endpoint_url else None)
+    )
+    if region:
+        kwargs["region_name"] = region
+    return kwargs
+
+
+def s3_endpoint_url() -> str | None:
+    explicit = (
+        os.environ.get("AWS_ENDPOINT_URL_S3")
+        or os.environ.get("AWS_ENDPOINT_URL")
+        or os.environ.get("R2_ENDPOINT_URL")
+        or os.environ.get("CLOUDFLARE_R2_ENDPOINT_URL")
+    )
+    if explicit:
+        return explicit
+    account_id = os.environ.get("R2_ACCOUNT_ID") or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    if account_id:
+        return f"https://{account_id}.r2.cloudflarestorage.com"
+    return None
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:

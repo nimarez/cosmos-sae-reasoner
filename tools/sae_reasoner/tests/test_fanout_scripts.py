@@ -56,6 +56,7 @@ def test_plan_activation_fanout_worker_command():
         phase="prefill",
         max_new_tokens=128,
         activation_dtype="bfloat16",
+        batch_size=4,
         max_examples=None,
         python="python",
         resume=True,
@@ -75,6 +76,8 @@ def test_plan_activation_fanout_worker_command():
     assert plan.command[plan.command.index("--worker-index") + 1] == "5"
     assert "--num-workers" in plan.command
     assert plan.command[plan.command.index("--num-workers") + 1] == "8"
+    assert "--batch-size" in plan.command
+    assert plan.command[plan.command.index("--batch-size") + 1] == "4"
     assert "--resume" in plan.command
     assert "--wandb-run-name" in plan.command
     assert plan.command[plan.command.index("--wandb-run-name") + 1] == "robotsim_l18_worker_005"

@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from tools.sae_reasoner.storage import s3_client
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Wait for activation collection to finish, then launch a planned SAE sweep.")
@@ -69,17 +71,13 @@ def log_has_collect_complete(path: Path) -> bool:
 
 
 def count_activation_objects(uri: str) -> dict[str, int]:
-    try:
-        import boto3
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("S3 counting requires boto3.") from exc
     parsed = urlparse(uri)
     if parsed.scheme != "s3":
         raise ValueError("--activation-dir must be an S3 URI for wait_for_collection_then_sweep")
     prefix = parsed.path.lstrip("/").rstrip("/") + "/"
     pt = 0
     sidecars = 0
-    for page in boto3.client("s3").get_paginator("list_objects_v2").paginate(Bucket=parsed.netloc, Prefix=prefix):
+    for page in s3_client().get_paginator("list_objects_v2").paginate(Bucket=parsed.netloc, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             pt += int(key.endswith(".pt"))

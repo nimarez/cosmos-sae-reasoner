@@ -104,6 +104,24 @@ def test_build_token_map_marks_visual_tokens_and_positions():
     assert meta["visual_grid"]["merged_grid_thw"] == [1, 2, 2]
 
 
+def test_build_token_map_supports_batched_rows_and_padding():
+    batch = {
+        "input_ids": torch.tensor([[0, 0, 1, 3, 2], [1, 3, 4, 4, 2]]),
+        "attention_mask": torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]]),
+        "mm_token_type_ids": torch.tensor([[0, 0, 0, 0, 0], [0, 0, 1, 1, 0]]),
+        "image_grid_thw": torch.tensor([[1, 2, 2], [1, 4, 4]]),
+    }
+
+    first, _ = build_token_map(processor=FakeProcessor(), batch=batch, media_type="image", row_index=0)
+    second, meta = build_token_map(processor=FakeProcessor(), batch=batch, media_type="image", row_index=1)
+
+    assert [token["token_id"] for token in first] == [1, 3, 2]
+    assert [token["index"] for token in first] == [0, 1, 2]
+    assert second[2]["kind"] == "image"
+    assert second[2]["visual_position"]["patch_y_range"] == [0, 2]
+    assert meta["visual_grid"]["grid_thw"] == [1, 4, 4]
+
+
 def test_load_video_frames_preserves_metadata(monkeypatch):
     from tools.sae_reasoner.runtime import cosmos_hf
 

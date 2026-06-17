@@ -2,11 +2,133 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from .artifacts import ensure_dir, read_jsonl
+
+
+def _feature_map_to_thw(feature_map: Any):
+    """Coerce a feature map to a float numpy array of shape [T, H, W] ([H, W] -> T=1)."""
+    import numpy as np
+
+    arr = feature_map.detach().cpu().numpy() if hasattr(feature_map, "detach") else np.asarray(feature_map)
+    arr = np.asarray(arr, dtype=float)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        raise ValueError(f"feature_map must be [T, H, W] or [H, W], got shape {tuple(arr.shape)}")
+    return arr
+
+
+def _select_frame_indices(n_frames: int, max_frames: int | None) -> list[int]:
+    """Evenly subsample frame indices down to max_frames (keeps first and last)."""
+    if max_frames is None or n_frames <= max_frames:
+        return list(range(n_frames))
+    import numpy as np
+
+    return sorted({int(round(i)) for i in np.linspace(0, n_frames - 1, max_frames)})
+
+
+def _coerce_background_frames(frames: Any) -> list[Any] | None:
+    """Normalize an optional background (PIL image, [H,W,3], [T,H,W,3], or a list) into a frame list."""
+    if frames is None:
+        return None
+    import numpy as np
+
+    if isinstance(frames, (list, tuple)):
+        return [np.asarray(frame) for frame in frames]
+    array = np.asarray(frames)
+    if array.ndim == 4:
+        return [array[i] for i in range(array.shape[0])]
+    if array.ndim == 3:
+        return [array]
+    raise ValueError(f"frames must be a PIL image, [H,W,C], [T,H,W,C], or a list; got shape {tuple(array.shape)}")
+
+
+def plot_feature_heatmap(
+    feature_map: Any,
+    *,
+    frames: Any = None,
+    max_frames: int | None = 8,
+    cols: int = 4,
+    cmap: str = "inferno",
+    alpha: float = 0.5,
+    normalize: str | None = "global",
+    interpolation: str = "nearest",
+    title: str | None = None,
+    figsize_per_tile: tuple[float, float] = (3.0, 3.0),
+):
+    """Render a per-frame heatmap of an SAE feature's spatiotemporal activation map for a notebook.
+
+    feature_map: a [T, H, W] (or [H, W]) array/tensor, e.g. one value of feature_activation_maps().
+                 Images are T=1; video is T=num_frames.
+    frames:      optional background image(s) to overlay the heatmap on — a PIL image, an [H,W,3]
+                 or [T,H,W,3] array, or a list of frames. The low-res grid is upsampled to fit.
+    normalize:   "global" (shared color scale + colorbar across frames), "per_frame", or None (raw).
+
+    Returns the matplotlib Figure so the notebook displays it (and you can savefig it).
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - depends on optional notebook dep
+        raise RuntimeError("plot_feature_heatmap requires matplotlib; `pip install matplotlib`") from exc
+    import numpy as np
+
+    grid = _feature_map_to_thw(feature_map)
+    indices = _select_frame_indices(grid.shape[0], max_frames)
+    backgrounds = _coerce_background_frames(frames)
+    is_video = grid.shape[0] > 1
+
+    global_vmin = global_vmax = None
+    if normalize == "global":
+        finite = grid[np.isfinite(grid)]
+        global_vmin = float(finite.min()) if finite.size else 0.0
+        global_vmax = float(finite.max()) if finite.size else 1.0
+
+    count = len(indices)
+    ncols = max(1, min(cols, count))
+    nrows = math.ceil(count / ncols)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(ncols * figsize_per_tile[0], nrows * figsize_per_tile[1]),
+        squeeze=False,
+    )
+
+    mappable = None
+    for tile, frame_idx in enumerate(indices):
+        ax = axes[tile // ncols][tile % ncols]
+        heat = grid[frame_idx]
+        vmin, vmax = global_vmin, global_vmax
+        if normalize == "per_frame":
+            finite = heat[np.isfinite(heat)]
+            vmin = float(finite.min()) if finite.size else 0.0
+            vmax = float(finite.max()) if finite.size else 1.0
+        background = backgrounds[frame_idx] if backgrounds is not None and frame_idx < len(backgrounds) else None
+        if background is not None:
+            ax.imshow(background)
+            height, width = int(background.shape[0]), int(background.shape[1])
+            mappable = ax.imshow(
+                heat, cmap=cmap, alpha=alpha, vmin=vmin, vmax=vmax,
+                extent=[0, width, height, 0], interpolation=interpolation, aspect="auto",
+            )
+        else:
+            mappable = ax.imshow(heat, cmap=cmap, vmin=vmin, vmax=vmax, interpolation=interpolation)
+        ax.set_title(f"frame {frame_idx}" if is_video else "feature map", fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    for empty in range(count, nrows * ncols):
+        axes[empty // ncols][empty % ncols].axis("off")
+
+    if mappable is not None and normalize == "global":
+        fig.colorbar(mappable, ax=axes.ravel().tolist(), shrink=0.8, label="feature activation")
+    if title:
+        fig.suptitle(title)
+    return fig
 
 
 def render_feature_report(features_path: Path, output: Path, *, title: str = "Cosmos SAE Feature Browser") -> None:

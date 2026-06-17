@@ -1,6 +1,56 @@
 from pathlib import Path
 
-from tools.sae_reasoner.visualize import render_feature_report, render_neighbor_report
+import pytest
+
+from tools.sae_reasoner.visualize import (
+    _coerce_background_frames,
+    _feature_map_to_thw,
+    _select_frame_indices,
+    plot_feature_heatmap,
+    render_feature_report,
+    render_neighbor_report,
+)
+
+
+def test_feature_map_to_thw_promotes_2d_to_single_frame():
+    import numpy as np
+
+    arr = _feature_map_to_thw(np.zeros((2, 3)))
+    assert arr.shape == (1, 2, 3)  # image map [H,W] -> [1,H,W]
+    assert _feature_map_to_thw(np.zeros((4, 2, 3))).shape == (4, 2, 3)
+    with pytest.raises(ValueError):
+        _feature_map_to_thw(np.zeros((2, 2, 2, 2)))
+
+
+def test_select_frame_indices_subsamples_evenly():
+    assert _select_frame_indices(3, 8) == [0, 1, 2]  # fewer than cap -> all
+    picked = _select_frame_indices(100, 5)
+    assert picked[0] == 0 and picked[-1] == 99
+    assert len(picked) == 5
+    assert picked == sorted(picked)
+
+
+def test_coerce_background_frames_shapes():
+    import numpy as np
+
+    assert _coerce_background_frames(None) is None
+    single = _coerce_background_frames(np.zeros((8, 8, 3)))
+    assert len(single) == 1
+    video = _coerce_background_frames(np.zeros((4, 8, 8, 3)))
+    assert len(video) == 4
+
+
+def test_plot_feature_heatmap_smoke():
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import numpy as np
+
+    fig = plot_feature_heatmap(np.random.rand(2, 3, 4), title="feat 7")
+    # 2 frames -> at least 2 image tiles laid out
+    assert len(fig.axes) >= 2
+    fig_img = plot_feature_heatmap(np.random.rand(3, 5), frames=np.zeros((20, 20, 3), dtype="uint8"))
+    assert len(fig_img.axes) >= 1
+    matplotlib.pyplot.close("all")
 
 
 def test_render_feature_report(tmp_path: Path):

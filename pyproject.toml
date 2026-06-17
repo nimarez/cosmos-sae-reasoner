@@ -17,6 +17,7 @@ sae = [
   "pillow",
   "qwen-vl-utils",
   "safetensors",
+  "scikit-learn>=1.8",
   "torch",
   "torchvision",
   "transformers>=4.57.0",

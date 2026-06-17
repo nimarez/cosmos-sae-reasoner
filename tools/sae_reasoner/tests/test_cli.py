@@ -13,6 +13,7 @@ from tools.sae_reasoner.cli import (
     cmd_collect_activations,
     cmd_steer,
     collect_metric,
+    feature_activation_maps,
     feature_frequency_summary,
     load_activation_dataset,
     load_activation_examples,
@@ -269,6 +270,60 @@ def test_build_corpus_manifest_parser_hf_tar_s3_options():
     assert args.num_workers == 8
     assert args.resume is True
     assert args.stream_tars is True
+
+
+def test_build_corpus_manifest_parser_supports_physical_ai_token_budget():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "build-corpus-manifest",
+            "--source",
+            "physical-ai-instruct",
+            "--output",
+            "manifest.jsonl",
+            "--target-tokens",
+            "1000000",
+            "--estimated-video-tokens",
+            "2048",
+            "--estimated-image-tokens",
+            "512",
+            "--estimated-text-tokens",
+            "128",
+            "--max-records",
+            "0",
+        ]
+    )
+
+    assert args.source == "physical-ai-instruct"
+    assert args.target_tokens == 1_000_000
+    assert args.estimated_video_tokens == 2048
+    assert args.estimated_image_tokens == 512
+    assert args.estimated_text_tokens == 128
+    assert args.max_records == 0
+
+
+def test_build_corpus_manifest_parser_supports_hf_tar_range():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "build-corpus-manifest",
+            "--source",
+            "hf-tar-range",
+            "--hf-repo-id",
+            "org/repo",
+            "--prompt",
+            "Describe.",
+            "--include-glob",
+            "data/*.tar",
+            "--member-glob",
+            "*.mp4",
+            "--output",
+            "manifest.jsonl",
+        ]
+    )
+
+    assert args.source == "hf-tar-range"
+    assert args.member_glob == ["*.mp4"]
 
 
 def test_render_feature_report_parser_defaults():
@@ -576,6 +631,182 @@ def test_load_activation_dataset_keeps_token_group_alignment(tmp_path: Path):
     assert data.group_counts["kind:video"] == 1
     assert data.group_counts["media:video"] == 1
     assert data.group_counts["special"] == 1
+
+
+def test_load_activation_dataset_threads_visual_coordinates(tmp_path: Path):
+    torch.save(
+        {
+            "activations": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            "meta": {
+                "id": "rec-7",
+                "visual_grid": {"merged_grid_thw": [1, 2, 3], "merge_size": 2},
+                "token_map": [
+                    {"index": 0, "kind": "text", "phase": "prefill", "role": "system"},
+                    {"index": 1, "kind": "image", "phase": "prefill", "role": "user", "visual_position": {"frame": 0, "patch_y": 0, "patch_x": 1}},
+                    {"index": 2, "kind": "image", "phase": "prefill", "role": "user", "visual_position": {"frame": 0, "patch_y": 1, "patch_x": 2}},
+                ],
+            },
+        },
+        tmp_path / "000000_rec.pt",
+    )
+
+    data = load_activation_dataset(tmp_path)
+
+    assert len(data.token_coords) == data.activations.shape[0] == 3
+    # Row 0: a text token has no visual position but keeps record provenance.
+    assert data.token_coords[0]["record"] == "rec-7"
+    assert data.token_coords[0]["kind"] == "text"
+    assert data.token_coords[0]["frame"] is None
+    # Rows 1-2: visual tokens carry (frame, patch_y, patch_x) + merged grid dims for (T, H, W) reshape.
+    assert (data.token_coords[1]["frame"], data.token_coords[1]["patch_y"], data.token_coords[1]["patch_x"]) == (0, 0, 1)
+    assert (data.token_coords[2]["frame"], data.token_coords[2]["patch_y"], data.token_coords[2]["patch_x"]) == (0, 1, 2)
+    assert (data.token_coords[2]["grid_t"], data.token_coords[2]["grid_h"], data.token_coords[2]["grid_w"]) == (1, 2, 3)
+
+
+def test_load_activation_dataset_coords_align_after_filtering(tmp_path: Path):
+    torch.save(
+        {
+            "activations": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            "meta": {
+                "id": "rec-9",
+                "token_map": [
+                    {"index": 0, "kind": "text", "phase": "decode", "role": "assistant"},
+                    {"index": 1, "kind": "video", "phase": "prefill", "role": "user", "visual_position": {"frame": 2, "patch_y": 0, "patch_x": 0}},
+                    {"index": 2, "kind": "text", "phase": "prefill", "role": "user"},
+                ],
+            },
+        },
+        tmp_path / "000000_rec.pt",
+    )
+
+    data = load_activation_dataset(tmp_path, phases={"prefill"})
+
+    # The decode row is filtered out; coords stay aligned to the kept rows.
+    assert data.activations.tolist() == [[4.0, 5.0, 6.0, 7.0], [8.0, 9.0, 10.0, 11.0]]
+    assert [c["index"] for c in data.token_coords] == [1, 2]
+    assert data.token_coords[0]["frame"] == 2
+    assert data.token_coords[1]["kind"] == "text"
+
+
+def _coord(record, index, kind, *, frame=None, patch_y=None, patch_x=None, grid=(None, None, None)):
+    return {
+        "record": record,
+        "index": index,
+        "kind": kind,
+        "frame": frame,
+        "patch_y": patch_y,
+        "patch_x": patch_x,
+        "grid_t": grid[0],
+        "grid_h": grid[1],
+        "grid_w": grid[2],
+    }
+
+
+def test_feature_activation_maps_image_is_single_frame():
+    from tools.sae_reasoner.cli import ActivationDataset
+
+    sae = TopKSAE(SAEConfig(input_dim=4, expansion_factor=2, top_k=8))  # top_k>=feature_dim -> no sparsity drop
+    activations = torch.randn(4, 4)
+    coords = [
+        _coord("img", 0, "text"),  # non-visual row, ignored
+        _coord("img", 1, "image", frame=0, patch_y=0, patch_x=0, grid=(1, 1, 3)),
+        _coord("img", 2, "image", frame=0, patch_y=0, patch_x=1, grid=(1, 1, 3)),
+        _coord("img", 3, "image", frame=0, patch_y=0, patch_x=2, grid=(1, 1, 3)),
+    ]
+    data = ActivationDataset(activations=activations, token_groups=[], group_counts={}, token_coords=coords)
+
+    maps = feature_activation_maps(data, sae, feature_id=1)
+
+    assert set(maps) == {"img"}
+    assert maps["img"].shape == (1, 1, 3)  # image -> T=1
+    with torch.no_grad():
+        expected = sae.encode(activations.float())[:, 1]
+    assert torch.allclose(maps["img"][0, 0, :], expected[1:4], atol=1e-6)
+
+
+def test_feature_activation_maps_video_spans_frames():
+    from tools.sae_reasoner.cli import ActivationDataset
+
+    sae = TopKSAE(SAEConfig(input_dim=4, expansion_factor=2, top_k=8))
+    activations = torch.randn(4, 4)
+    coords = [
+        _coord("vid", 0, "video", frame=0, patch_y=0, patch_x=0, grid=(2, 1, 2)),
+        _coord("vid", 1, "video", frame=0, patch_y=0, patch_x=1, grid=(2, 1, 2)),
+        _coord("vid", 2, "video", frame=1, patch_y=0, patch_x=0, grid=(2, 1, 2)),
+        _coord("vid", 3, "video", frame=1, patch_y=0, patch_x=1, grid=(2, 1, 2)),
+    ]
+    data = ActivationDataset(activations=activations, token_groups=[], group_counts={}, token_coords=coords)
+
+    maps = feature_activation_maps(data, sae, feature_id=0)
+
+    assert maps["vid"].shape == (2, 1, 2)  # video -> T=num_frames
+    with torch.no_grad():
+        expected = sae.encode(activations.float())[:, 0]
+    assert torch.allclose(maps["vid"][1, 0, 1], expected[3], atol=1e-6)
+
+
+def test_feature_activation_maps_filters_records_and_rejects_bad_feature():
+    from tools.sae_reasoner.cli import ActivationDataset
+
+    sae = TopKSAE(SAEConfig(input_dim=4, expansion_factor=2, top_k=8))
+    activations = torch.randn(2, 4)
+    coords = [
+        _coord("a", 0, "image", frame=0, patch_y=0, patch_x=0, grid=(1, 1, 1)),
+        _coord("b", 0, "image", frame=0, patch_y=0, patch_x=0, grid=(1, 1, 1)),
+    ]
+    data = ActivationDataset(activations=activations, token_groups=[], group_counts={}, token_coords=coords)
+
+    assert set(feature_activation_maps(data, sae, feature_id=0, records={"a"})) == {"a"}
+
+    try:
+        feature_activation_maps(data, sae, feature_id=999)
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("expected IndexError for out-of-range feature_id")
+
+
+def test_token_coords_default_stream_to_ar(tmp_path: Path):
+    torch.save(
+        {
+            "activations": torch.ones(2, 3),
+            "meta": {
+                "id": "rec",
+                "token_map": [
+                    {"index": 0, "kind": "text", "phase": "prefill", "stream": "ar"},
+                    {"index": 1, "kind": "text", "phase": "prefill"},  # legacy shard, no stream tag
+                ],
+            },
+        },
+        tmp_path / "000000_rec.pt",
+    )
+
+    data = load_activation_dataset(tmp_path)
+
+    assert [c["stream"] for c in data.token_coords] == ["ar", "ar"]
+
+
+def test_load_activation_dataset_rejects_mixed_streams(tmp_path: Path):
+    torch.save(
+        {"activations": torch.ones(1, 3), "meta": {"id": "a", "token_map": [{"index": 0, "kind": "text", "phase": "prefill", "stream": "ar"}]}},
+        tmp_path / "000000_a.pt",
+    )
+    torch.save(
+        {"activations": torch.full((1, 3), 2.0), "meta": {"id": "b", "token_map": [{"index": 0, "kind": "image", "phase": "prefill", "stream": "diffusion"}]}},
+        tmp_path / "000001_b.pt",
+    )
+
+    try:
+        load_activation_dataset(tmp_path)
+    except ValueError as exc:
+        assert "residual streams" in str(exc)
+    else:
+        raise AssertionError("expected ValueError when a load spans multiple residual streams")
+
+    # Selecting a single stream resolves the conflict.
+    ar_only = load_activation_dataset(tmp_path, stream="ar")
+    assert ar_only.activations.shape[0] == 1
+    assert {c["stream"] for c in ar_only.token_coords} == {"ar"}
 
 
 def test_load_activation_matrix_filters_by_split(tmp_path: Path):

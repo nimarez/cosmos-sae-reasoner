@@ -22,8 +22,8 @@ uv run --no-project --with pytest --with torch python -m pytest tools/sae_reason
 
 The real SAE corpus should not be the tiny smoke manifest. Use neutral,
 pretraining-like records and keep media remote until activation collection.
-The builder writes JSONL manifests with `hf://...` or `s3://...` media paths;
-`collect-activations` downloads only the current record into
+The builder writes JSONL manifests with `hf://...`, `hf-tar-range://...`, or
+`s3://...` media paths; `collect-activations` downloads only the current record into
 `COSMOS_SAE_MEDIA_CACHE` or `.cache/sae_reasoner/media`.
 
 First-party robotics recipes:
@@ -48,12 +48,51 @@ python -m tools.sae_reasoner build-corpus-manifest \
   --output outputs/sae_reasoner/manifests/robotics_libero.jsonl
 ```
 
-`physicalai-driving` and `physicalai-vantage` remain available, but the default
-SAE notebook is robotics-focused.
+`physicalai-driving` and `physicalai-vantage` remain available as single-source
+recipes.
 
-The `robotics-bridge-captions` recipe pairs each video with the repo's
-per-clip `caption.txt` sidecar when available. Passing `--prompt` overrides
-that and falls back to a fixed template.
+The robotics recipes preserve available dataset context in the prompt. The
+`robotics-bridge-captions` recipe pairs each video with the repo's per-clip
+`caption.txt` sidecar when available. The `robotics-bridge` and
+`robotics-libero` recipes read LeRobot `meta/episodes/*.parquet` task
+annotations and attach the unique task strings for each video shard. Those MP4s
+can contain multiple episodes, so the prompt explicitly treats the annotations
+as shard-level context rather than a per-frame or per-episode caption. Passing
+`--prompt` disables recipe sidecar/task context and uses the fixed template
+provided on the command line.
+
+For the Physical AI instruction/steering corpus, use the composite recipe. It
+mixes RobotSim, DriveSim, PhyxSim, Warehouse, SynHuman, Bridge, Bridge captions,
+and LIBERO with prompt families for state, next action, contact, affordance,
+failure, hazards, physics, temporal reasoning, and short plans. It writes
+instruction-shaped prefill prompts only; expected answers are not inserted into
+the prompt.
+
+```bash
+python -m tools.sae_reasoner build-corpus-manifest \
+  --source recipe \
+  --recipe physical-ai-instruct \
+  --target-tokens 10000000 \
+  --max-records 0 \
+  --max-shards 0 \
+  --max-shard-gb 0 \
+  --output outputs/sae_reasoner/manifests/physical_ai_instruct_10m.jsonl
+```
+
+The tar-sharded Physical AI sources use `hf-tar-range://` media paths instead
+of uploading media to R2/S3. Manifest construction scans tar headers to record
+member byte ranges; activation collection later range-fetches only the selected
+MP4 into the local media cache with retries. RobotSim uses paired same-tar JSON
+captions as the base context. PhyxSim uses matching `captions/.../*.tar` shards
+and extracts the available VLM/physics caption for the selected MP4 member.
+DriveSim is not tar-sharded in the released repo, so that bucket uses direct
+loose `hf://` MP4 paths and the matching `description/*.json`
+`t2w_windows[].qwen2p5_7b_caption` text. Warehouse and SynHuman currently use
+the physical-reasoning prompt template because the released sidecars are
+metadata/state files rather than natural-language caption sidecars. `--target-tokens`
+is approximate and based on `--estimated-video-tokens`,
+`--estimated-image-tokens`, and `--estimated-text-tokens`; use
+`--max-records 0` when the token budget should control the final size.
 
 Cosmos RobotSim SDG is tar-sharded on Hugging Face, so use a bounded
 materialization step to extract a small sample of MP4s to S3 and write a normal
@@ -67,8 +106,8 @@ set +a
 python -m tools.sae_reasoner build-corpus-manifest \
   --source recipe \
   --recipe physicalai-robotsim \
-  --s3-uri s3://my-bucket/cosmos/robotsim/run_001 \
-  --manifest-s3-uri s3://my-bucket/cosmos/robotsim/run_001/manifest.jsonl \
+  --s3-uri s3://interpretability/cosmos/robotsim/run_001 \
+  --manifest-s3-uri s3://interpretability/cosmos/robotsim/run_001/manifest.jsonl \
   --max-records 100 \
   --max-shards 1 \
   --max-shard-gb 1.0 \
@@ -78,17 +117,39 @@ python -m tools.sae_reasoner build-corpus-manifest \
 `--max-shards` is intentionally important: each RobotSim shard can be large, so
 start with `--max-records 10 --max-shards 1 --max-shard-gb 1.0` before scaling
 up. Use `--max-shard-gb 0` only when you are willing to download large shards.
-The generated manifest points at `s3://...` media and can be used directly by
-`collect-activations`; uploaded S3 manifests can also be used as `--manifest
-s3://bucket/key.jsonl`.
+The generated manifest points at `s3://...` media, uses RobotSim's paired JSON
+`caption` as the prompt when available, and stores compact non-caption JSON
+fields under `metadata.robotsim_sidecar`. Full paired JSON files are uploaded
+under `sidecars/` next to the `media/` prefix. The manifest can be used directly
+by `collect-activations`; uploaded S3/R2 manifests can also be used as
+`--manifest s3://bucket/key.jsonl`.
+
+All `s3://bucket/key` paths use the shared S3-compatible client. For Cloudflare
+R2, keep the `s3://` scheme and put the R2 bucket name in the URI, for example
+`s3://interpretability/cosmos/robotsim/full_v1`. Set either `R2_ACCOUNT_ID` or
+`R2_ENDPOINT_URL` in `.env`; the bucket/key path stays AWS-style while the
+endpoint routes the calls to R2:
+
+```bash
+R2_ACCOUNT_ID=...
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+# Optional alternative to R2_ACCOUNT_ID:
+# R2_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
+```
+
+The same scripts also honor `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` and normal
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` credentials.
 
 For a full RobotSim materialization, fan out the existing extractor across
 cheap CPU pods. Each worker owns a stable hash partition of tar shards, uploads
-its MP4s to the shared media prefix, and writes a per-worker manifest:
+its MP4s to the shared `media/` prefix, uploads paired JSON metadata to
+`sidecars/`, and writes a per-worker manifest with caption prompts already
+filled in:
 
 ```bash
 python -m tools.sae_reasoner.scripts.plan_robotsim_fanout \
-  --s3-uri s3://my-bucket/cosmos/robotsim/full_v1 \
+  --s3-uri s3://interpretability/cosmos/robotsim/full_v1 \
   --num-workers 8 \
   --output-root outputs/sae_reasoner/robotsim_fanout/full_v1 \
   --max-records-per-worker 0 \
@@ -103,28 +164,34 @@ After all worker manifests are uploaded, combine them into one sorted manifest:
 
 ```bash
 python -m tools.sae_reasoner.scripts.combine_manifest_shards \
-  --input-prefix s3://my-bucket/cosmos/robotsim/full_v1/manifests/ \
+  --input-prefix s3://interpretability/cosmos/robotsim/full_v1/manifests/ \
   --output outputs/sae_reasoner/manifests/robotsim_full_v1.jsonl \
-  --manifest-s3-uri s3://my-bucket/cosmos/robotsim/full_v1/final_manifest.jsonl
+  --manifest-s3-uri s3://interpretability/cosmos/robotsim/full_v1/final_manifest.jsonl
 ```
 
-To use RobotSim's generated per-clip captions without re-uploading MP4s, enrich
-the combined manifest from the paired JSON sidecars. This preserves each
-`media_path`, replaces the generic prompt with the sidecar `caption`, and stores
-compact non-caption sidecar fields under `metadata.robotsim_sidecar`:
+The `enrich_robotsim_manifest_sidecars` script remains only as a repair tool for
+older manifests created before JSON sidecars were folded into extraction.
+
+Nemotron VLM v2 is conversation JSONL plus tar-bundled media. The recipe reads
+the conversation rows, extracts the first image/video reference, range-fetches
+that media from the dataset's `.nv-meta/index.sqlite` tar index, uploads the
+selected media to S3/R2, and writes a normal manifest:
 
 ```bash
-python -m tools.sae_reasoner.scripts.enrich_robotsim_manifest_sidecars \
-  --manifest s3://my-bucket/cosmos/robotsim/full_v1/final_manifest.jsonl \
-  --output outputs/sae_reasoner/manifests/robotsim_full_v1_captioned.jsonl \
-  --sidecar-s3-uri s3://my-bucket/cosmos/robotsim/full_v1/sidecars \
-  --manifest-s3-uri s3://my-bucket/cosmos/robotsim/full_v1/final_manifest_captioned.jsonl
+python -m tools.sae_reasoner build-corpus-manifest \
+  --source recipe \
+  --recipe nemotron-vlm-v2 \
+  --s3-uri s3://interpretability/cosmos/nemotron-vlm-v2/run_001 \
+  --manifest-s3-uri s3://interpretability/cosmos/nemotron-vlm-v2/run_001/manifest.jsonl \
+  --max-records 1000 \
+  --resume \
+  --output outputs/sae_reasoner/manifests/nemotron_vlm_v2_run_001.jsonl
 ```
 
-For faster enrichment, run the same command across workers with unique local
-outputs and unique `--manifest-s3-uri` values, adding `--worker-index N
---num-workers K`; then combine those captioned worker manifests with
-`combine_manifest_shards`.
+Only subsets with bundled media indexes are included. JSONL rows that point to
+external or absent media, such as some COCO/ActivityNet-style references, are
+skipped. The prompt is built from pre-assistant system/user text; the first
+assistant text is kept in metadata for inspection rather than sent to the model.
 
 Generic HF file repos:
 
@@ -143,7 +210,7 @@ S3 media prefixes:
 ```bash
 python -m tools.sae_reasoner build-corpus-manifest \
   --source s3-prefix \
-  --s3-uri s3://my-bucket/cosmos/media/ \
+  --s3-uri s3://interpretability/cosmos/media/ \
   --include-glob '*.mp4' \
   --prompt 'Describe the key physical events and likely next state.' \
   --max-records 1000 \
@@ -198,10 +265,11 @@ python -m tools.sae_reasoner collect-activations \
   --activation-dtype bfloat16 \
   --max-examples 8
 
-# Real runs should save activation shards directly to S3. Credentials are read
-# from the environment by boto3: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-# optional AWS_SESSION_TOKEN, and AWS_DEFAULT_REGION.
-export COSMOS_SAE_ACTIVATION_S3_URI="${COSMOS_SAE_ACTIVATION_S3_URI:-s3://cosmos-interpretability/sae_reasoner/activations}"
+# Real runs should save activation shards directly to S3-compatible storage.
+# For AWS S3, boto3 reads AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, optional
+# AWS_SESSION_TOKEN, and AWS_DEFAULT_REGION. For R2, set R2_ACCOUNT_ID,
+# R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY.
+export COSMOS_SAE_ACTIVATION_S3_URI="${COSMOS_SAE_ACTIVATION_S3_URI:-s3://interpretability/sae_reasoner/activations}"
 ACTIVATION_URI="${COSMOS_SAE_ACTIVATION_S3_URI%/}/sample_l18"
 
 python -m tools.sae_reasoner collect-activations \
@@ -223,8 +291,8 @@ python -m tools.sae_reasoner collect-activations \
 # --num-workers, writes stable per-record shards, and writes
 # metadata/worker_*.jsonl instead of clobbering metadata.jsonl.
 python -m tools.sae_reasoner.scripts.plan_activation_fanout \
-  --manifest s3://cosmos-interpretability/cosmos/robotsim/full_v1_stream_20260616/final_manifest_captioned.jsonl \
-  --output-dir s3://cosmos-interpretability/sae_reasoner/activations/robotsim_l18_full_prefill \
+  --manifest s3://interpretability/cosmos/robotsim/full_v1_stream_20260616_r2/final_manifest.jsonl \
+  --output-dir s3://interpretability/sae_reasoner/activations/robotsim_l18_full_prefill \
   --output-root outputs/sae_reasoner/activation_fanout/robotsim_l18_full_prefill \
   --num-workers 8 \
   --layer 18 \
@@ -247,8 +315,19 @@ python -m tools.sae_reasoner train-sae \
   --max-grad-norm 0 \
   --train-splits sae_train \
   --val-splits sae_val \
+  --shuffle-seed 0 \
+  --checkpoint-dir "$ACTIVATION_URI/../checkpoints/l18" \
+  --checkpoint-every 100 \
   --log-every 10 \
   --steps 500
+
+# Resume an interrupted run from the latest checkpoint (local dir or s3:// prefix):
+python -m tools.sae_reasoner train-sae \
+  --activation-dir "$ACTIVATION_URI" \
+  --output outputs/sae_reasoner/saes/l18.pt \
+  --checkpoint-dir "$ACTIVATION_URI/../checkpoints/l18" \
+  --resume-from "$ACTIVATION_URI/../checkpoints/l18" \
+  --steps 1000
 
 python -m tools.sae_reasoner find-features \
   --activation-dir "$ACTIVATION_URI" \
@@ -314,7 +393,9 @@ with raw signed TopK via `--topk-activation topk`, `find-features` can rank by
 to `<output>.metrics.jsonl`. Metrics include reconstruction loss, MSE,
 explained variance, L0, batch-local feature firing/dead/usage summaries,
 train-vs-validation gaps, decoder-norm summaries, approximate decoder duplicate
-cosine summaries, gradient norm, learning rate, tokens seen, elapsed seconds,
+cosine summaries, gradient norm, learning rate, tokens seen (cumulative batch
+rows), `epoch`, `new_tokens_seen` (distinct rows drawn) and `data_coverage`,
+elapsed seconds,
 and grouped reconstruction metrics for token classes such as `kind:video`,
 `kind:special`, `phase_kind:prefill:video`, and `role:user`. Set
 `WANDB_API_KEY` and pass `--wandb-project`, or set `WANDB_PROJECT` in the
@@ -348,6 +429,71 @@ selected tokens. If W&B is enabled for `analyze-sae`, it logs full-dataset
 histograms for feature fire rate, fire count, and mean absolute active
 activation. Use these full-dataset dead/rare-feature metrics alongside W&B
 training curves; batch-local `dead_feature_frac_batch` is only a dynamics signal.
+
+## Linear-Probe Baseline
+
+Before trusting that an SAE feature "represents" some concept, check that a cheap
+logistic-regression probe on the *raw* residual-stream activations doesn't already
+do at least as well. This is the baseline from Kantamneni et al., "Are Sparse
+Autoencoders Useful? A Case Study in Sparse Probing" (arXiv:2502.16681), which
+found SAE features rarely beat it. `train-linear-probe` trains that probe over a
+labeled task and reports held-out AUC:
+
+```bash
+# Smoke test first: a probe should nail media_type (AUC ~1.0). If it doesn't, the
+# activation/label join is broken — fix that before trusting any real result.
+python -m tools.sae_reasoner train-linear-probe \
+  --activation-dir "$ACTIVATION_URI" \
+  --manifest "$MANIFEST_URI" \
+  --label-field media_type \
+  --aggregation last \
+  --output outputs/sae_reasoner/probes/media_type.json
+
+# A real concept probe: positive class = records carrying the 'physics' tag.
+python -m tools.sae_reasoner train-linear-probe \
+  --activation-dir "$ACTIVATION_URI" \
+  --manifest "$MANIFEST_URI" \
+  --label-tag physics \
+  --aggregation mean \
+  --output outputs/sae_reasoner/probes/physics.json
+```
+
+Labels come from exactly one source: `--label-tag TAG` (binary tag presence,
+zero relabeling), `--label-key KEY` (`record.metadata[KEY]`), or `--label-field
+FIELD` (a record field such as `media_type`). Each record's tokens are reduced to
+one vector via `--aggregation {last,mean,max}` (`last` matches the paper; `mean`
+suits whole-record concept tags). `--token-kinds`, `--phases`, `--splits`, and
+`--stream` restrict which tokens are loaded (a multi-stream load is rejected, as
+elsewhere). `--penalty l2` is the paper baseline; the probe does a stratified
+train/test split with a size-adaptive CV grid search over `C` and writes a JSON
+summary with `test_auc`, `best_c`, and class balance. As a sanity check, a
+random-label task should land near AUC 0.5.
+
+### SAE-vs-baseline comparison
+
+`compare-sae-probe` runs the rigorous head-to-head from the paper: a raw-activation
+baseline probe versus an **SAE-feature probe** that selects the top-k SAE latents by
+mean-absolute class difference (on the training set only) and probes just those with
+L1 logistic regression. It reports both AUCs and whether the SAE actually wins:
+
+```bash
+python -m tools.sae_reasoner compare-sae-probe \
+  --activation-dir "$ACTIVATION_URI" \
+  --manifest "$MANIFEST_URI" \
+  --sae outputs/sae_reasoner/saes/l18.pt \
+  --label-tag physics \
+  --aggregation mean \
+  --k-values 16,128 \
+  --output outputs/sae_reasoner/probes/physics_compare.json
+```
+
+Both probes are built over the same records and use the same train/test split, so the
+AUCs are directly comparable. The summary JSON carries `baseline`, one `sae_probes`
+entry per k (each with `auc_delta`, `sae_wins`, and the `selected_feature_ids` used),
+and a top-level `sae_beats_baseline`. SAE features are aggregated *after* encoding
+(`last` token's feature vector, or mean/max-pooled features), since the SAE is
+non-linear. The paper's headline finding is that the SAE rarely clears the baseline —
+treat `sae_beats_baseline: true` as the bar a "useful feature" claim must pass.
 
 For the BridgeData synthetic-caption prefill dataset, start with the compact
 batch-size/LR sweep at 8x expansion rather than 16x:
@@ -388,6 +534,18 @@ Training also defaults to `--activation-norm sqrt_d`, which scales raw residual
 activations inside the SAE so their average L2 norm is `sqrt(hidden_dim)`. The
 saved SAE stores that scale and unscales reconstruction deltas, so steering hooks
 still edit the model's raw residual stream.
+
+Mini-batches are drawn **without replacement** from a freshly shuffled permutation
+each epoch (constant batch size, trailing remainder dropped), fully determined by
+`--shuffle-seed`. That makes `epoch`/`new_tokens_seen`/`data_coverage` meaningful
+and lets `--resume-from` reproduce the exact batch stream after an interruption.
+
+Cosmos 3 is a Mixture-of-Transformers: autoregressive and diffusion tokens share
+attention but are routed through **separate residual streams** with separate
+parameters. The current collector only exercises the AR stream (understanding
+forward), so activations are tagged `stream=ar`. Each SAE is trained on a single
+stream — `--stream ar` selects it, and a load that spans more than one stream is
+rejected (train one SAE per stream rather than pooling them).
 
 By default, manifests use separate splits for SAE optimization, reconstruction
 validation, feature browsing, and final steering checks:

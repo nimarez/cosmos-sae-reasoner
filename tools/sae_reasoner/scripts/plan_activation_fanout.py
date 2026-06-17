@@ -28,6 +28,7 @@ def main() -> int:
     parser.add_argument("--phase", choices=["prefill", "decode", "both"], default="prefill")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--activation-dtype", choices=["auto", "float32", "bfloat16", "float16"], default="bfloat16")
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--python", default=".venv/bin/python")
     parser.add_argument("--env-file", default=".env")
@@ -98,6 +99,8 @@ def make_worker_plan(args: argparse.Namespace, *, worker_index: int) -> Activati
         str(args.max_new_tokens),
         "--activation-dtype",
         args.activation_dtype,
+        "--batch-size",
+        str(args.batch_size),
         "--worker-index",
         str(worker_index),
         "--num-workers",

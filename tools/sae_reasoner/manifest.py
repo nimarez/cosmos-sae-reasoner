@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from .artifacts import iter_jsonl, repo_root, write_jsonl
-from .storage import parse_s3_uri
+from .storage import parse_s3_uri, s3_client
 
 MediaType = Literal["text", "image", "video"]
 
@@ -96,14 +96,8 @@ def iter_manifest_json(path: Path | str) -> Iterator[dict[str, Any]]:
             yield obj
         return
     if parsed.scheme == "s3":
-        try:
-            import boto3
-        except Exception as exc:  # pragma: no cover - depends on optional env
-            raise RuntimeError("S3 manifest input requires boto3.") from exc
         bucket, key = parse_s3_uri(raw)
-        endpoint_url = __import__("os").environ.get("AWS_ENDPOINT_URL_S3") or __import__("os").environ.get("AWS_ENDPOINT_URL")
-        kwargs = {"endpoint_url": endpoint_url} if endpoint_url else {}
-        body = boto3.client("s3", **kwargs).get_object(Bucket=bucket, Key=key)["Body"]
+        body = s3_client().get_object(Bucket=bucket, Key=key)["Body"]
         for line_no, line in enumerate((line.decode("utf-8") for line in body.iter_lines()), start=1):
             line = line.strip()
             if not line:
@@ -168,4 +162,4 @@ def make_sample_manifest(output: Path) -> list[ManifestRecord]:
 
 
 def is_remote_media_path(path: str) -> bool:
-    return urlparse(path).scheme in {"hf", "http", "https", "s3"}
+    return urlparse(path).scheme in {"hf", "hf-tar-range", "http", "https", "s3"}

@@ -5,7 +5,7 @@ import hashlib
 import json
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -45,23 +45,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("build-corpus-manifest", help="stream external corpus metadata into a neutral manifest")
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--source", choices=["recipe", "hf-files", "hf-dataset", "hf-tar-s3", "s3-prefix", "jsonl"], default="recipe")
+    p.add_argument(
+        "--source",
+        choices=[
+            "recipe",
+            "hf-files",
+            "hf-dataset",
+            "hf-tar-s3",
+            "hf-tar-range",
+            "hf-conversation-tar-s3",
+            "physical-ai-instruct",
+            "s3-prefix",
+            "jsonl",
+        ],
+        default="recipe",
+    )
     p.add_argument("--recipe", default="robotics-bridge-captions")
     p.add_argument("--hf-repo-id", default=None)
     p.add_argument("--hf-split", default="train")
     p.add_argument("--s3-uri", default=None)
     p.add_argument("--input-uri", default=None)
     p.add_argument("--include-glob", action="append", default=[])
-    p.add_argument("--member-glob", action="append", default=[], help="Tar member glob for --source hf-tar-s3, e.g. '*.mp4'.")
+    p.add_argument("--member-glob", action="append", default=[], help="Tar member glob for tar-backed HF sources, e.g. '*.mp4'.")
     p.add_argument("--prompt", default=None)
     p.add_argument("--media-type", choices=["auto", "text", "image", "video"], default="auto")
     p.add_argument("--max-records", type=int, default=1000)
-    p.add_argument("--max-shards", type=int, default=1, help="Maximum tar shards to download for --source hf-tar-s3 after worker partitioning. Use 0 for all assigned shards.")
-    p.add_argument("--max-shard-gb", type=float, default=1.0, help="Skip tar shards larger than this for --source hf-tar-s3. Use 0 for no size filter.")
-    p.add_argument("--shard-list", default=None, help="Optional local/S3 JSONL shard list for --source hf-tar-s3. Rows may contain shard_path/path/shard.")
-    p.add_argument("--worker-index", type=int, default=0, help="Zero-based fan-out worker index for hf-tar-s3 shard partitioning.")
-    p.add_argument("--num-workers", type=int, default=1, help="Total fan-out workers for hf-tar-s3 shard partitioning.")
-    p.add_argument("--resume", action="store_true", help="For hf-tar-s3, skip uploading media objects that already exist in S3.")
+    p.add_argument("--max-shards", type=int, default=1, help="Maximum tar shards to scan for tar-backed HF sources after worker partitioning. Use 0 for all assigned shards.")
+    p.add_argument("--max-shard-gb", type=float, default=1.0, help="Skip tar shards larger than this for tar-backed HF sources. Use 0 for no size filter.")
+    p.add_argument("--shard-list", default=None, help="Optional local/S3 JSONL shard list for tar-backed HF sources. Rows may contain shard_path/path/shard.")
+    p.add_argument("--worker-index", type=int, default=0, help="Zero-based fan-out worker index for materializing tar-backed HF sources.")
+    p.add_argument("--num-workers", type=int, default=1, help="Total fan-out workers for materializing tar-backed HF sources.")
+    p.add_argument("--resume", action="store_true", help="For materialized HF sources, skip uploading media objects that already exist in S3.")
     p.add_argument("--stream-tars", action="store_true", help="For hf-tar-s3, stream tar shards from Hugging Face instead of downloading each shard to disk.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--split-ratios", default="sae_train=0.85,sae_val=0.10,feature_labeling=0.025,steering_eval=0.025")
@@ -73,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shuffle-buffer", type=int, default=10000)
     p.add_argument("--min-text-chars", type=int, default=64)
     p.add_argument("--max-text-chars", type=int, default=8000)
+    p.add_argument("--target-tokens", type=int, default=0, help="Approximate total token budget for composite recipes. Use --max-records 0 to avoid the final record cap.")
+    p.add_argument("--estimated-image-tokens", type=int, default=1024)
+    p.add_argument("--estimated-video-tokens", type=int, default=4096)
+    p.add_argument("--estimated-text-tokens", type=int, default=256)
     p.set_defaults(func=cmd_build_corpus_manifest)
 
     p = sub.add_parser("inspect-model", help="load model and print hook points")
@@ -93,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true", help="Skip records whose activation shard and metadata sidecar already exist.")
     p.add_argument("--worker-index", type=int, default=0, help="Zero-based activation collection worker index.")
     p.add_argument("--num-workers", type=int, default=1, help="Total activation collection workers. Records are assigned by global manifest index modulo this value.")
+    p.add_argument("--batch-size", type=int, default=1, help="Number of records per prefill forward pass. Decode collection currently requires 1.")
     p.add_argument("--phase", choices=["prefill", "decode", "both"], default="prefill")
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument(
@@ -135,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to train on. Empty means all.")
     p.add_argument("--phases", default="", help="Optional comma-separated phases to train on. Empty means all.")
     p.add_argument("--train-splits", default="sae_train", help="Comma-separated manifest splits used for training. Empty means all splits.")
+    p.add_argument("--stream", default="", help="Restrict to one Mixture-of-Transformers residual stream (e.g. 'ar'). Empty uses all; a load that spans multiple streams is rejected.")
     p.add_argument("--val-splits", default="sae_val", help="Comma-separated manifest splits used for reconstruction validation. Empty disables validation.")
     p.add_argument(
         "--feature-report-splits",
@@ -208,6 +228,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_wandb_args(p)
     p.set_defaults(func=cmd_analyze_sae)
 
+    p = sub.add_parser(
+        "train-linear-probe",
+        help="train a logistic-regression probe baseline on raw activations (arXiv:2502.16681)",
+    )
+    add_probe_common_args(p)
+    p.add_argument("--penalty", choices=["l2", "l1"], default="l2", help="Logistic-regression penalty. 'l2' is the paper baseline.")
+    p.set_defaults(func=cmd_train_linear_probe)
+
+    p = sub.add_parser(
+        "compare-sae-probe",
+        help="compare an SAE-feature probe against the raw-activation baseline (arXiv:2502.16681)",
+    )
+    add_probe_common_args(p)
+    p.add_argument("--sae", type=Path, required=True, help="Trained SAE checkpoint.")
+    p.add_argument("--k-values", default="16,128", help="Comma-separated top-k latent counts for the SAE probe (paper uses 16,128).")
+    p.add_argument("--penalty", choices=["l2", "l1"], default="l2", help="Baseline (raw-activation) probe penalty.")
+    p.add_argument("--sae-penalty", choices=["l1", "l2"], default="l1", help="SAE-feature probe penalty (paper uses L1).")
+    p.add_argument("--batch-size", type=int, default=4096, help="Encode batch size for SAE feature extraction.")
+    p.add_argument("--device", default=None, help="Device for SAE encoding (default cpu).")
+    p.set_defaults(func=cmd_compare_sae_probe)
+
     p = sub.add_parser("render-feature-report", help="render feature examples as a standalone HTML report")
     p.add_argument("--features", type=Path, required=True)
     p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/reports/features.html"))
@@ -247,6 +288,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, default=Path("outputs/sae_reasoner/reports/steer_result.json"))
     p.set_defaults(func=cmd_steer)
     return parser
+
+
+def add_probe_common_args(parser: argparse.ArgumentParser) -> None:
+    """Args shared by `train-linear-probe` and `compare-sae-probe` (arXiv:2502.16681)."""
+    parser.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    parser.add_argument("--manifest", required=True, help="Manifest JSONL (local/http/s3) supplying per-record labels.")
+    g = parser.add_mutually_exclusive_group(required=True)
+    g.add_argument("--label-tag", default=None, help="Binary label: 1 if the record has this tag else 0.")
+    g.add_argument("--label-key", default=None, help="Label from record.metadata[KEY]; records missing it are dropped.")
+    g.add_argument("--label-field", default=None, help="Label from a record field (e.g. media_type). Good smoke test.")
+    parser.add_argument("--aggregation", choices=["last", "mean", "max"], default="last", help="Per-record token reduction. 'last' matches the paper.")
+    parser.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to include. Empty means all.")
+    parser.add_argument("--phases", default="", help="Optional comma-separated token phases to include. Empty means all.")
+    parser.add_argument("--splits", default="", help="Comma-separated manifest splits to include. Empty means all.")
+    parser.add_argument("--stream", default="", help="Restrict to one residual stream (e.g. 'ar'). Empty uses all; a multi-stream load is rejected.")
+    parser.add_argument("--max-train", type=int, default=1024, help="Cap training examples (paper uses 1024). <=0 disables.")
+    parser.add_argument("--test-frac", type=float, default=0.2)
+    parser.add_argument("--no-standardize", dest="standardize", action="store_false", help="Disable z-scoring of features before the probe.")
+    parser.set_defaults(standardize=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output", type=Path, required=True, help="Summary JSON path.")
 
 
 def add_model_args(parser: argparse.ArgumentParser) -> None:
@@ -335,6 +397,10 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
             shuffle_buffer=args.shuffle_buffer,
             min_text_chars=args.min_text_chars,
             max_text_chars=args.max_text_chars,
+            target_tokens=args.target_tokens,
+            estimated_image_tokens=args.estimated_image_tokens,
+            estimated_video_tokens=args.estimated_video_tokens,
+            estimated_text_tokens=args.estimated_text_tokens,
         )
     )
     manifest_uri = None
@@ -348,6 +414,7 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
         split_counts[split] = split_counts.get(split, 0) + 1
         media_type = record.get("media_type", "unknown")
         media_counts[media_type] = media_counts.get(media_type, 0) + 1
+    estimated_tokens = sum(int((record.get("metadata") or {}).get("estimated_tokens") or 0) for record in records)
     print(
         json.dumps(
             {
@@ -356,6 +423,7 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
                 "num_records": len(records),
                 "split_counts": split_counts,
                 "media_counts": media_counts,
+                "estimated_tokens": estimated_tokens,
             },
             indent=2,
             sort_keys=True,
@@ -365,16 +433,10 @@ def cmd_build_corpus_manifest(args: argparse.Namespace) -> int:
 
 
 def upload_file_to_s3(path: Path, uri: str) -> str:
-    from .storage import parse_s3_uri
+    from .storage import parse_s3_uri, s3_client
 
-    try:
-        import boto3
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeLoadError("S3 manifest upload requires boto3. Install the sae dependency group.") from exc
     bucket, key = parse_s3_uri(uri)
-    endpoint_url = __import__("os").environ.get("AWS_ENDPOINT_URL_S3") or __import__("os").environ.get("AWS_ENDPOINT_URL")
-    kwargs = {"endpoint_url": endpoint_url} if endpoint_url else {}
-    boto3.client("s3", **kwargs).upload_file(
+    s3_client().upload_file(
         str(path),
         bucket,
         key,
@@ -419,6 +481,7 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
             "resume": args.resume,
             "worker_index": args.worker_index,
             "num_workers": args.num_workers,
+            "batch_size": args.batch_size,
             "phase": args.phase,
             "max_new_tokens": args.max_new_tokens,
             "activation_dtype": args.activation_dtype,
@@ -432,12 +495,88 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
         dtype=args.dtype,
         init_mode=args.init_mode,
     ).load()
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.batch_size != 1 and args.phase != "prefill":
+        raise ValueError("--batch-size greater than 1 is currently supported only with --phase prefill")
     metadata: list[dict[str, Any]] = []
     start = time.time()
     total_tokens = 0
     total_activation_bytes = 0
     skipped_examples = 0
     processed_examples = 0
+    pending: list[tuple[int, Any, str, str]] = []
+
+    def flush_pending() -> None:
+        nonlocal total_tokens, total_activation_bytes
+        if not pending:
+            return
+        batch = list(pending)
+        pending.clear()
+        batch_start = time.time()
+        if args.batch_size == 1:
+            results = [
+                runtime.collect_activations(
+                    record,
+                    layer=args.layer,
+                    phase=args.phase,
+                    max_new_tokens=args.max_new_tokens,
+                    prompt_format=args.prompt_format,
+                    system_prompt=args.system_prompt,
+                    activation_dtype=args.activation_dtype,
+                )
+                for _idx, record, _shard_name, _sidecar_name in batch
+            ]
+        else:
+            results = runtime.collect_prefill_batch(
+                [record for _idx, record, _shard_name, _sidecar_name in batch],
+                layer=args.layer,
+                prompt_format=args.prompt_format,
+                system_prompt=args.system_prompt,
+                activation_dtype=args.activation_dtype,
+            )
+        batch_seconds = max(1e-9, time.time() - batch_start)
+        per_record_seconds = batch_seconds / max(1, len(batch))
+        for (record_idx, record, shard_name, sidecar_name), (hidden, meta) in zip(batch, results):
+            shard_uri = store.write_torch(shard_name, {"activations": hidden, "meta": meta})
+            meta["shard"] = shard_name
+            meta["shard_uri"] = shard_uri
+            compact_meta = compact_activation_meta(meta)
+            metadata.append(compact_meta)
+            store.write_text(sidecar_name, json.dumps(compact_meta, ensure_ascii=True, sort_keys=True) + "\n")
+            elapsed = max(1e-9, time.time() - start)
+            activation_bytes = int(hidden.numel() * hidden.element_size())
+            total_tokens += int(meta["num_tokens"])
+            total_activation_bytes += activation_bytes
+            metric = collect_metric(
+                idx=len(metadata) - 1,
+                meta=meta,
+                activation_bytes=activation_bytes,
+                total_tokens=total_tokens,
+                total_activation_bytes=total_activation_bytes,
+                elapsed_seconds=elapsed,
+                record_seconds=per_record_seconds,
+            )
+            metric["collection_batch_size"] = len(batch)
+            metric["batch_seconds"] = batch_seconds
+            print(
+                json.dumps(
+                    {
+                        "event": "collect_metric",
+                        **metric,
+                        "record_index": record_idx,
+                        "worker_index": args.worker_index,
+                        "num_workers": args.num_workers,
+                        "collected": record.id,
+                        "shard": shard_name,
+                        "uri": shard_uri,
+                    }
+                ),
+                flush=True,
+            )
+            if wandb_run is not None:
+                wandb_run.log(metric, step=int(metric["collected_examples"]))
+
     for idx, record in enumerate(iter_manifest(args.manifest)):
         if args.max_examples is not None and idx >= args.max_examples:
             break
@@ -465,53 +604,10 @@ def cmd_collect_activations(args: argparse.Namespace) -> int:
                 flush=True,
             )
             continue
-        record_start = time.time()
-        hidden, meta = runtime.collect_activations(
-            record,
-            layer=args.layer,
-            phase=args.phase,
-            max_new_tokens=args.max_new_tokens,
-            prompt_format=args.prompt_format,
-            system_prompt=args.system_prompt,
-            activation_dtype=args.activation_dtype,
-        )
-        shard_uri = store.write_torch(shard_name, {"activations": hidden, "meta": meta})
-        meta["shard"] = shard_name
-        meta["shard_uri"] = shard_uri
-        compact_meta = compact_activation_meta(meta)
-        metadata.append(compact_meta)
-        store.write_text(sidecar_name, json.dumps(compact_meta, ensure_ascii=True, sort_keys=True) + "\n")
-        elapsed = max(1e-9, time.time() - start)
-        record_seconds = max(1e-9, time.time() - record_start)
-        activation_bytes = int(hidden.numel() * hidden.element_size())
-        total_tokens += int(meta["num_tokens"])
-        total_activation_bytes += activation_bytes
-        metric = collect_metric(
-            idx=processed_examples - 1,
-            meta=meta,
-            activation_bytes=activation_bytes,
-            total_tokens=total_tokens,
-            total_activation_bytes=total_activation_bytes,
-            elapsed_seconds=elapsed,
-            record_seconds=record_seconds,
-        )
-        print(
-            json.dumps(
-                {
-                    "event": "collect_metric",
-                    **metric,
-                    "record_index": idx,
-                    "worker_index": args.worker_index,
-                    "num_workers": args.num_workers,
-                    "collected": record.id,
-                    "shard": shard_name,
-                    "uri": shard_uri,
-                }
-            ),
-            flush=True,
-        )
-        if wandb_run is not None:
-            wandb_run.log(metric, step=int(metric["collected_examples"]))
+        pending.append((idx, record, shard_name, sidecar_name))
+        if len(pending) >= args.batch_size:
+            flush_pending()
+    flush_pending()
     metadata_text = "".join(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n" for record in metadata)
     metadata_name = activation_worker_metadata_name(worker_index=args.worker_index, num_workers=args.num_workers)
     metadata_uri = store.write_text(metadata_name, metadata_text)
@@ -607,6 +703,7 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
         token_kinds=parse_kind_filter(args.token_kinds),
         phases=parse_kind_filter(args.phases),
         splits=parse_kind_filter(args.train_splits),
+        stream=args.stream or None,
     )
     if train_data.activations is None:
         raise ValueError(f"no training activation shards found in {args.activation_dir}")
@@ -617,6 +714,7 @@ def cmd_train_sae(args: argparse.Namespace) -> int:
             token_kinds=parse_kind_filter(args.token_kinds),
             phases=parse_kind_filter(args.phases),
             splits=val_splits,
+            stream=args.stream or None,
             allow_empty=True,
         )
         if val_splits
@@ -1152,6 +1250,128 @@ def cmd_analyze_sae(args: argparse.Namespace) -> int:
     return 0
 
 
+def _probe_label_source(args: argparse.Namespace) -> str:
+    if args.label_tag is not None:
+        return f"tag:{args.label_tag}"
+    if args.label_key is not None:
+        return f"metadata:{args.label_key}"
+    return f"field:{args.label_field}"
+
+
+def _probe_config(args: argparse.Namespace, *, penalty: str):
+    from .linear_probe import LinearProbeConfig
+
+    return LinearProbeConfig(
+        aggregation=args.aggregation,
+        penalty=penalty,
+        max_train=args.max_train,
+        test_frac=args.test_frac,
+        standardize=args.standardize,
+        seed=args.seed,
+    )
+
+
+def _load_probe_inputs(args: argparse.Namespace):
+    """Shared probe-command setup: (records, label_map, data) joined by record id."""
+    from .linear_probe import build_label_map
+
+    records = list(iter_manifest(args.manifest))
+    label_map = build_label_map(
+        records,
+        label_tag=args.label_tag,
+        label_key=args.label_key,
+        label_field=args.label_field,
+    )
+    data = load_activation_dataset(
+        args.activation_dir,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=parse_kind_filter(args.splits),
+        stream=args.stream or None,
+    )
+    if data.activations is None:
+        raise ValueError(f"no activation shards found in {args.activation_dir}")
+    return records, label_map, data
+
+
+def _write_summary(path: Path, summary: dict[str, Any]) -> None:
+    ensure_dir(path.parent)
+    path.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+
+
+def cmd_train_linear_probe(args: argparse.Namespace) -> int:
+    from .linear_probe import assemble_probe_matrix, fit_probe
+
+    config = _probe_config(args, penalty=args.penalty)
+    records, label_map, data = _load_probe_inputs(args)
+    X, y, record_ids = assemble_probe_matrix(data, label_map, config)
+    result = fit_probe(X, y, config)
+
+    summary = {
+        "activation_dir": str(args.activation_dir),
+        "manifest": str(args.manifest),
+        "label_source": _probe_label_source(args),
+        "aggregation": args.aggregation,
+        "n_manifest_records": len(records),
+        "n_labeled_records": len(label_map),
+        "n_probed_records": len(record_ids),
+        "result": result.to_dict(),
+    }
+    _write_summary(args.output, summary)
+    return 0
+
+
+def cmd_compare_sae_probe(args: argparse.Namespace) -> int:
+    from .linear_probe import assemble_probe_matrix, assemble_sae_feature_matrix, fit_probe
+    from .sae import load_sae
+
+    k_values = [int(v) for v in args.k_values.split(",") if v.strip()]
+    if not k_values:
+        raise ValueError("--k-values must list at least one integer")
+
+    base_config = _probe_config(args, penalty=args.penalty)
+    sae_config = _probe_config(args, penalty=args.sae_penalty)
+    records, label_map, data = _load_probe_inputs(args)
+    sae = load_sae(str(args.sae), map_location=args.device or "cpu")
+
+    # Aligned matrices over the same records → identical train/test split (same seed + label order).
+    raw_X, y, record_ids = assemble_probe_matrix(data, label_map, base_config)
+    sae_X, _, _ = assemble_sae_feature_matrix(data, sae, label_map, sae_config, batch_size=args.batch_size)
+
+    baseline = fit_probe(raw_X, y, base_config)
+    baseline_auc = baseline.test_auc
+    sae_results = []
+    for k in k_values:
+        result = fit_probe(sae_X, y, sae_config, select_top_k=k)
+        sae_results.append(
+            {
+                "k": k,
+                "auc_delta": result.test_auc - baseline_auc,
+                "sae_wins": result.test_auc > baseline_auc,
+                "result": result.to_dict(),
+            }
+        )
+
+    best_sae = max(sae_results, key=lambda r: r["result"]["test_auc"])
+    summary = {
+        "activation_dir": str(args.activation_dir),
+        "manifest": str(args.manifest),
+        "sae": str(args.sae),
+        "label_source": _probe_label_source(args),
+        "aggregation": args.aggregation,
+        "feature_dim": int(sae.config.feature_dim),
+        "n_probed_records": len(record_ids),
+        "baseline": baseline.to_dict(),
+        "sae_probes": sae_results,
+        "best_sae_auc": best_sae["result"]["test_auc"],
+        "best_sae_k": best_sae["k"],
+        "sae_beats_baseline": best_sae["result"]["test_auc"] > baseline_auc,
+    }
+    _write_summary(args.output, summary)
+    return 0
+
+
 def feature_frequency_summary(
     *,
     fire_counts,
@@ -1456,6 +1676,10 @@ class ActivationDataset:
     activations: Any | None
     token_groups: list[tuple[str, ...]]
     group_counts: dict[str, int]
+    # Parallel to the activation rows: spatiotemporal provenance of each token (record id,
+    # token index, kind, and visual (frame, patch_y, patch_x) + merged grid dims when visual).
+    # Empty visual fields for non-visual tokens. Enables reshaping features back to (T, H, W).
+    token_coords: list[dict[str, Any]] = field(default_factory=list)
 
 
 def load_activation_matrix(
@@ -1481,6 +1705,7 @@ def load_activation_dataset(
     token_kinds: set[str] | None = None,
     phases: set[str] | None = None,
     splits: set[str] | None = None,
+    stream: str | None = None,
     allow_empty: bool = False,
 ) -> ActivationDataset:
     import torch
@@ -1488,6 +1713,7 @@ def load_activation_dataset(
 
     shards = []
     token_group_rows: list[tuple[str, ...]] = []
+    token_coord_rows: list[dict[str, Any]] = []
     token_kinds = token_kinds or set()
     phases = phases or set()
     splits = splits or set()
@@ -1499,26 +1725,111 @@ def load_activation_dataset(
             acts = payload["activations"].reshape(-1, payload["activations"].shape[-1])
             token_map = meta.get("token_map") or []
             keep = list(range(acts.shape[0]))
-            if token_kinds or phases:
+            if token_kinds or phases or stream:
                 keep = [
                     idx
                     for idx in range(acts.shape[0])
-                    if token_matches_filters(token_info_for_index(token_map, idx), token_kinds=token_kinds, phases=phases)
+                    if token_matches_filters(
+                        token_info_for_index(token_map, idx), token_kinds=token_kinds, phases=phases, stream=stream
+                    )
                 ]
                 if not keep:
                     continue
                 acts = acts[torch.tensor(keep, dtype=torch.long)]
             shards.append(acts)
-            token_group_rows.extend(token_metric_groups(token_info_for_index(token_map, idx)) for idx in keep)
+            kept_infos = [token_info_for_index(token_map, idx) for idx in keep]
+            token_group_rows.extend(token_metric_groups(info) for info in kept_infos)
+            token_coord_rows.extend(token_row_coords(meta, info) for info in kept_infos)
     if not shards:
         if allow_empty:
-            return ActivationDataset(activations=None, token_groups=[], group_counts={})
+            return ActivationDataset(activations=None, token_groups=[], group_counts={}, token_coords=[])
         raise ValueError(f"no activation shards found in {path}")
+    # Guard against silently pooling two residual streams into one SAE (Mixture-of-Transformers):
+    # AR-routed and diffusion-routed tokens have different parameters and statistics. If a load
+    # spans more than one stream, the caller must pick one via stream=...
+    streams = {coord.get("stream") for coord in token_coord_rows}
+    if len(streams) > 1:
+        raise ValueError(
+            f"activation set mixes residual streams {sorted(map(str, streams))}; "
+            "train per-stream SAEs and select one with stream=..."
+        )
     return ActivationDataset(
         activations=torch.cat(shards, dim=0),
         token_groups=token_group_rows,
         group_counts=count_group_memberships(token_group_rows),
+        token_coords=token_coord_rows,
     )
+
+
+def feature_activation_maps(
+    data: ActivationDataset,
+    sae: Any,
+    feature_id: int,
+    *,
+    records: set[str] | None = None,
+    batch_size: int = 4096,
+    fill: float = 0.0,
+) -> dict[str, Any]:
+    """Per-record (T, H, W) maps of one SAE feature's activation over visual tokens.
+
+    Encodes the dataset's activations with ``sae``, takes the chosen feature column, and scatters
+    each visual row's value into its record's (frame, patch_y, patch_x) grid cell. Images come back
+    as T=1; video as T=num_frames. Non-visual rows are ignored. Records with no visual tokens (and,
+    when ``records`` is given, records outside the set) are omitted.
+    """
+    import torch
+
+    if data.activations is None or not data.token_coords:
+        return {}
+    if feature_id < 0 or feature_id >= int(sae.config.feature_dim):
+        raise IndexError(f"feature_id={feature_id} outside [0, {int(sae.config.feature_dim)})")
+
+    # Group visual rows by record (a row is visual iff it has a full grid position).
+    rows_by_record: dict[str, list[int]] = {}
+    for row, coord in enumerate(data.token_coords):
+        if coord.get("frame") is None or coord.get("patch_y") is None or coord.get("patch_x") is None:
+            continue
+        record = coord.get("record")
+        if records is not None and record not in records:
+            continue
+        rows_by_record.setdefault(record, []).append(row)
+    if not rows_by_record:
+        return {}
+
+    # Encode only the rows we need, in batches, and read off the feature column.
+    needed = sorted({row for rows in rows_by_record.values() for row in rows})
+    device = next(sae.parameters()).device
+    column: dict[int, float] = {}
+    sae.eval()
+    with torch.no_grad():
+        for start in range(0, len(needed), batch_size):
+            batch_rows = needed[start : start + batch_size]
+            chunk = data.activations[torch.tensor(batch_rows, dtype=torch.long)].to(device=device, dtype=torch.float32)
+            feats = sae.encode(chunk)[:, feature_id].detach().to("cpu", torch.float32)
+            for row, value in zip(batch_rows, feats.tolist()):
+                column[row] = value
+
+    maps: dict[str, Any] = {}
+    for record, rows in rows_by_record.items():
+        coords = [data.token_coords[row] for row in rows]
+        t_dim = _grid_extent(coords, "grid_t", "frame")
+        h_dim = _grid_extent(coords, "grid_h", "patch_y")
+        w_dim = _grid_extent(coords, "grid_w", "patch_x")
+        grid = torch.full((t_dim, h_dim, w_dim), float(fill), dtype=torch.float32)
+        for row, coord in zip(rows, coords):
+            frame, patch_y, patch_x = int(coord["frame"]), int(coord["patch_y"]), int(coord["patch_x"])
+            if 0 <= frame < t_dim and 0 <= patch_y < h_dim and 0 <= patch_x < w_dim:
+                grid[frame, patch_y, patch_x] = column[row]
+        maps[record] = grid
+    return maps
+
+
+def _grid_extent(coords: list[dict[str, Any]], dim_key: str, index_key: str) -> int:
+    """Grid size along one axis: prefer the stored merged-grid dim, else max observed index + 1."""
+    dims = [int(c[dim_key]) for c in coords if c.get(dim_key) is not None]
+    if dims:
+        return max(dims)
+    return max(int(c[index_key]) for c in coords) + 1
 
 
 def activation_split(meta: dict[str, Any]) -> str:
@@ -1526,13 +1837,41 @@ def activation_split(meta: dict[str, Any]) -> str:
     return str(metadata.get("split") or "sae_train")
 
 
-def token_matches_filters(token: dict[str, Any] | None, *, token_kinds: set[str], phases: set[str]) -> bool:
+def token_matches_filters(token: dict[str, Any] | None, *, token_kinds: set[str], phases: set[str], stream: str | None = None) -> bool:
     token = token or {}
     if token_kinds and token.get("kind") not in token_kinds:
         return False
     if phases and token.get("phase") not in phases:
         return False
+    if stream and (token.get("stream") or "ar") != stream:
+        return False
     return True
+
+
+def token_row_coords(meta: dict[str, Any], token: dict[str, Any] | None) -> dict[str, Any]:
+    """Spatiotemporal provenance for one activation row, aligned to its training-tensor index.
+
+    Carries the record id, the token's index within that record, its kind, and — for visual
+    tokens — the (frame, patch_y, patch_x) grid position plus the record's merged (t, h, w)
+    grid dimensions, so feature activations can be scattered back into per-record (T, H, W) maps.
+    """
+    token = token or {}
+    position = token.get("visual_position") or {}
+    merged = (meta.get("visual_grid") or {}).get("merged_grid_thw") or []
+    return {
+        "record": meta.get("id"),
+        "index": token.get("index"),
+        "kind": token.get("kind"),
+        # Residual stream (Mixture-of-Transformers): "ar" for understanding/AR tokens. Shards
+        # collected before the tag existed are AR-only, so default to "ar" rather than None.
+        "stream": token.get("stream") or "ar",
+        "frame": position.get("frame"),
+        "patch_y": position.get("patch_y"),
+        "patch_x": position.get("patch_x"),
+        "grid_t": merged[0] if len(merged) > 0 else None,
+        "grid_h": merged[1] if len(merged) > 1 else None,
+        "grid_w": merged[2] if len(merged) > 2 else None,
+    }
 
 
 def token_metric_groups(token: dict[str, Any] | None) -> tuple[str, ...]:

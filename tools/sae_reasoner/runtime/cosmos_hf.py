@@ -174,6 +174,58 @@ class CosmosReasonerRuntime:
             raise RuntimeLoadError(f"processor could not build inputs for record {record.id!r}") from exc
         return {k: v.to(self.device) if hasattr(v, "to") else v for k, v in batch.items()}, text
 
+    def inputs_for_records(
+        self,
+        records: list[ManifestRecord],
+        *,
+        prompt_format: PromptFormat = "chat",
+        system_prompt: str | None = None,
+    ) -> tuple[dict[str, torch.Tensor], list[str]]:
+        if not records:
+            raise ValueError("records must not be empty")
+        if self.init_mode == "meta":
+            raise RuntimeLoadError("init_mode=meta can inspect architecture but cannot run inputs or forward passes")
+        media_types = {record.media_type for record in records}
+        if len(media_types) != 1:
+            raise RuntimeLoadError("batched activation collection requires records with the same media_type")
+        media_type = records[0].media_type
+        processor, _ = self.require_processor_and_model()
+        rendered_prompts: list[str] = []
+        materialized_paths: list[str] = []
+        for record in records:
+            render_record = record
+            if record.media_type != "text":
+                materialized = materialize_media_path(record.media_path)
+                materialized_paths.append(materialized)
+                render_record = replace(record, media_path=materialized)
+            rendered_prompts.append(
+                render_record_prompt(
+                    processor,
+                    render_record,
+                    prompt_format=prompt_format,
+                    system_prompt=system_prompt,
+                )
+            )
+        kwargs: dict[str, Any] = {"text": rendered_prompts, "return_tensors": "pt", "padding": True}
+        if media_type == "image":
+            from PIL import Image
+
+            kwargs["images"] = [Image.open(path).convert("RGB") for path in materialized_paths]
+        elif media_type == "video":
+            videos = []
+            video_metadata = []
+            for path in materialized_paths:
+                video_frames, one_video_metadata = load_video_frames_with_metadata(path)
+                videos.append(video_frames)
+                video_metadata.append(one_video_metadata)
+            kwargs["videos"] = videos
+            kwargs["video_metadata"] = video_metadata
+        try:
+            batch = processor(**kwargs)
+        except Exception as exc:  # pragma: no cover - processor-specific
+            raise RuntimeLoadError(f"processor could not build batched inputs for {len(records)} records") from exc
+        return {k: v.to(self.device) if hasattr(v, "to") else v for k, v in batch.items()}, rendered_prompts
+
     @torch.no_grad()
     def collect_prefill(
         self,
@@ -229,6 +281,86 @@ class CosmosReasonerRuntime:
             "token_map": token_map,
         }
         return hidden, meta
+
+    @torch.no_grad()
+    def collect_prefill_batch(
+        self,
+        records: list[ManifestRecord],
+        *,
+        layer: int,
+        prompt_format: PromptFormat = "chat",
+        system_prompt: str | None = None,
+        activation_dtype: ActivationSaveDType = "bfloat16",
+    ) -> list[tuple[torch.Tensor, dict[str, Any]]]:
+        if len(records) == 1:
+            return [
+                self.collect_prefill(
+                    records[0],
+                    layer=layer,
+                    prompt_format=prompt_format,
+                    system_prompt=system_prompt,
+                    activation_dtype=activation_dtype,
+                )
+            ]
+        if self.init_mode == "meta":
+            raise RuntimeLoadError("init_mode=meta can inspect architecture but cannot collect activations")
+        _, model = self.require_loaded()
+        captures: list[torch.Tensor] = []
+        save_dtype = _resolve_activation_save_dtype(activation_dtype, self.dtype)
+
+        def capture(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+            hidden = _extract_hidden(output)
+            captures.append(_capture_activation(hidden, save_dtype))
+
+        inputs, rendered_prompts = self.inputs_for_records(
+            records,
+            prompt_format=prompt_format,
+            system_prompt=system_prompt,
+        )
+        with self._hook(layer, capture):
+            outputs = model(**inputs, use_cache=False)
+        if not captures:
+            raise RuntimeLoadError(f"no activation captured at layer {layer}")
+        hidden_batch = captures[-1]
+        out: list[tuple[torch.Tensor, dict[str, Any]]] = []
+        for row_index, record in enumerate(records):
+            token_map, token_meta = build_token_map(
+                processor=getattr(self, "processor", None),
+                batch=inputs,
+                media_type=record.media_type,
+                row_index=row_index,
+            )
+            hidden = hidden_batch[row_index]
+            keep_positions = _active_positions(inputs.get("attention_mask"), row_index=row_index)
+            if keep_positions and len(keep_positions) <= int(hidden.shape[0]):
+                hidden = hidden[torch.tensor(keep_positions, dtype=torch.long)]
+            elif len(token_map) < int(hidden.shape[0]):
+                hidden = hidden[: len(token_map)]
+            if len(token_map) != int(hidden.shape[0]):
+                token_map = token_map[: int(hidden.shape[0])]
+            meta = {
+                "id": record.id,
+                "media_type": record.media_type,
+                "prompt": record.prompt,
+                "prompt_format": prompt_format,
+                "system_prompt": system_prompt,
+                "media_path": record.media_path,
+                "tags": list(record.tags),
+                "metadata": record.metadata or {},
+                "rendered_prompt": rendered_prompts[row_index],
+                "num_tokens": int(hidden.shape[0]),
+                "hidden_dim": int(hidden.shape[-1]),
+                "activation_dtype": str(hidden.dtype).replace("torch.", ""),
+                "model_output_type": type(outputs).__name__,
+                "input_summary": summarize_batch(inputs),
+                "token_kind_counts": count_token_kinds(token_map),
+                "visual_grid": token_meta.get("visual_grid"),
+                "token_map": token_map,
+                "phase": "prefill",
+                "token_phase_counts": count_token_phases(token_map),
+            }
+            out.append((hidden, meta))
+        return out
 
     @torch.no_grad()
     def collect_activations(
@@ -534,18 +666,23 @@ def build_token_map(
     processor: Any | None,
     batch: dict[str, Any],
     media_type: str,
+    row_index: int = 0,
     context_radius: int = 8,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    input_ids = _first_row(batch.get("input_ids"))
-    mm_token_type_ids = _first_row(batch.get("mm_token_type_ids"))
+    input_ids = _row_values(batch.get("input_ids"), row_index=row_index)
+    mm_token_type_ids = _row_values(batch.get("mm_token_type_ids"), row_index=row_index)
+    attention_mask = _row_values(batch.get("attention_mask"), row_index=row_index)
     tokenizer = getattr(processor, "tokenizer", None)
-    visual_grid = _visual_grid_metadata(processor, batch, media_type, mm_token_type_ids)
+    visual_grid = _visual_grid_metadata(processor, batch, media_type, mm_token_type_ids, row_index=row_index)
     visual_ordinal = 0
     tokens: list[dict[str, Any]] = []
     role_state = ChatRoleState()
-    for idx, token_id in enumerate(input_ids):
+    for raw_idx, token_id in enumerate(input_ids):
+        if raw_idx < len(attention_mask) and int(attention_mask[raw_idx]) == 0:
+            continue
+        idx = len(tokens)
         token_text = _decode_token(tokenizer, token_id)
-        is_visual = idx < len(mm_token_type_ids) and int(mm_token_type_ids[idx]) != 0
+        is_visual = raw_idx < len(mm_token_type_ids) and int(mm_token_type_ids[raw_idx]) != 0
         kind = media_type if is_visual and media_type in {"image", "video"} else _token_kind(tokenizer, token_id, token_text)
         role = role_state.update(token_text)
         entry: dict[str, Any] = {
@@ -553,6 +690,11 @@ def build_token_map(
             "kind": kind,
             "phase": "prefill",
             "role": role,
+            # Residual stream this token is routed through. Cosmos 3 is a Mixture-of-Transformers:
+            # AR-routed and diffusion-routed params share attention but write separate residual
+            # streams. The understanding forward only exercises the AR stream, so this is "ar";
+            # a future generation collector would tag diffusion-subsequence tokens "diffusion".
+            "stream": "ar",
             "token_id": int(token_id),
             "token_text": token_text,
         }
@@ -645,6 +787,7 @@ def build_decode_token_map(
             "kind": _token_kind(tokenizer, token_id, token_text),
             "phase": "decode",
             "role": "assistant",
+            "stream": "ar",  # decode tokens are autoregressive; see prefill note on Mixture-of-Transformers streams
             "token_id": int(token_id),
             "token_text": token_text,
             "generated_index": int(generated_index),
@@ -954,6 +1097,10 @@ def _load_video_frames_with_pyav(path: str, *, frame_limit: int) -> tuple[Any, A
 
 
 def _first_row(value: Any) -> list[int]:
+    return _row_values(value, row_index=0)
+
+
+def _row_values(value: Any, *, row_index: int) -> list[int]:
     if value is None:
         return []
     if hasattr(value, "detach"):
@@ -961,8 +1108,17 @@ def _first_row(value: Any) -> list[int]:
     if hasattr(value, "tolist"):
         value = value.tolist()
     if value and isinstance(value[0], list):
-        value = value[0]
+        if row_index >= len(value):
+            return []
+        value = value[row_index]
     return [int(item) for item in value]
+
+
+def _active_positions(attention_mask: Any, *, row_index: int) -> list[int]:
+    row = _row_values(attention_mask, row_index=row_index)
+    if not row:
+        return []
+    return [idx for idx, value in enumerate(row) if int(value) != 0]
 
 
 def _decode_token(tokenizer: Any | None, token_id: int) -> str:
@@ -997,12 +1153,13 @@ def _visual_grid_metadata(
     batch: dict[str, Any],
     media_type: str,
     mm_token_type_ids: list[int],
+    row_index: int = 0,
 ) -> dict[str, Any] | None:
     grid_key = "video_grid_thw" if media_type == "video" else "image_grid_thw"
     grid_rows = _grid_rows(batch.get(grid_key))
     if not grid_rows:
         return None
-    t, h, w = grid_rows[0]
+    t, h, w = grid_rows[min(row_index, len(grid_rows) - 1)]
     visual_tokens = sum(1 for value in mm_token_type_ids if int(value) != 0)
     merge_size = _merge_size(processor, t, h, w, visual_tokens)
     merged_h = max(1, h // merge_size)

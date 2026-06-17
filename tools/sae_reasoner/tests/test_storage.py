@@ -3,7 +3,15 @@ import types
 
 import torch
 
-from tools.sae_reasoner.storage import LocalActivationStore, S3ActivationStore, iter_activation_payloads, parse_s3_uri, read_text_uri
+from tools.sae_reasoner.storage import (
+    LocalActivationStore,
+    S3ActivationStore,
+    iter_activation_payloads,
+    parse_s3_uri,
+    read_text_uri,
+    s3_client,
+    s3_client_kwargs,
+)
 
 
 def test_parse_s3_uri():
@@ -14,6 +22,70 @@ def test_parse_s3_uri():
 def test_s3_store_key_joining():
     store = S3ActivationStore(bucket="bucket", prefix="prefix/path/")
     assert store.key("/000001_example.pt") == "prefix/path/000001_example.pt"
+
+
+def test_s3_client_kwargs_supports_r2_env(monkeypatch):
+    for key in (
+        "AWS_ENDPOINT_URL_S3",
+        "AWS_ENDPOINT_URL",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "R2_ENDPOINT_URL",
+        "CLOUDFLARE_R2_ENDPOINT_URL",
+        "R2_ACCOUNT_ID",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_REGION",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("R2_ACCOUNT_ID", "abc123")
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "key")
+    monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "secret")
+
+    assert s3_client_kwargs() == {
+        "endpoint_url": "https://abc123.r2.cloudflarestorage.com",
+        "aws_access_key_id": "key",
+        "aws_secret_access_key": "secret",
+        "region_name": "auto",
+    }
+
+
+def test_s3_client_forwards_r2_kwargs(monkeypatch):
+    captured = {}
+    for key in (
+        "AWS_ENDPOINT_URL_S3",
+        "AWS_ENDPOINT_URL",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "R2_REGION",
+        "R2_ACCOUNT_ID",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_R2_ENDPOINT_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    def fake_client(service, **kwargs):
+        captured["service"] = service
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setenv("R2_ENDPOINT_URL", "https://example.r2.cloudflarestorage.com")
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "key")
+    monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setitem(__import__("sys").modules, "boto3", types.SimpleNamespace(client=fake_client))
+
+    s3_client()
+
+    assert captured == {
+        "service": "s3",
+        "kwargs": {
+            "endpoint_url": "https://example.r2.cloudflarestorage.com",
+            "aws_access_key_id": "key",
+            "aws_secret_access_key": "secret",
+            "region_name": "auto",
+        },
+    }
 
 
 def test_local_activation_store_roundtrip(tmp_path: Path):

@@ -48,6 +48,16 @@ def test_manifest_accepts_remote_media_path():
     assert record.metadata == {"source": "hf-files"}
     assert record.to_json()["metadata"] == {"source": "hf-files"}
 
+    range_record = ManifestRecord.from_json(
+        {
+            "id": "remote-range-video",
+            "media_type": "video",
+            "media_path": "hf-tar-range://dataset/nvidia/example/data/shard.tar?offset=512&size=10&name=clip.mp4",
+            "prompt": "describe this",
+        }
+    )
+    assert range_record.media_path.startswith("hf-tar-range://dataset/")
+
 
 def test_load_manifest_from_s3_uri(monkeypatch):
     class FakeBody:
