@@ -388,6 +388,72 @@ def test_phyxsim_recipe_uses_matching_caption_tar(monkeypatch, tmp_path: Path):
     assert records[0]["metadata"]["sidecar_member"] == "ball_mixer_abc_0/camera_e.json"
 
 
+def test_phyxsim_recipe_searches_category_caption_tars(monkeypatch, tmp_path: Path):
+    video_tar_path = tmp_path / "videos-obstruction-00006.tar"
+    wrong_caption_tar_path = tmp_path / "captions-obstruction-00006.tar"
+    right_caption_tar_path = tmp_path / "captions-obstruction-00000.tar"
+    clip_path = tmp_path / "LowAngle.mp4"
+    clip_path.write_bytes(b"fake phyxsim mp4")
+    caption_path = tmp_path / "LowAngle.json"
+    caption_path.write_text(
+        '{"Qwen3-VL-30B-A3B-Instruct": {"long": "Balls collide with obstacles on a table."}}',
+        encoding="utf-8",
+    )
+    with tarfile.open(video_tar_path, "w") as tar:
+        tar.add(clip_path, arcname="obstruction_14d45a68_1608/LowAngle.mp4")
+    with tarfile.open(wrong_caption_tar_path, "w") as tar:
+        pass
+    with tarfile.open(right_caption_tar_path, "w") as tar:
+        tar.add(caption_path, arcname="obstruction_14d45a68_1608/LowAngle.json")
+
+    class FakeHfApi:
+        def list_repo_files(self, repo_id: str, repo_type: str):
+            assert repo_id == "nvidia/PhysicalAI-WorldModel-Synthetic-Physical-Interaction-Scenes"
+            assert repo_type == "dataset"
+            return [
+                "videos/obstruction/videos-obstruction-00006.tar",
+                "captions/obstruction/captions-obstruction-00000.tar",
+                "captions/obstruction/captions-obstruction-00006.tar",
+            ]
+
+    downloaded: list[str] = []
+
+    def fake_download(repo_id: str, repo_type: str, filename: str, local_dir: str):
+        downloaded.append(filename)
+        if filename == "videos/obstruction/videos-obstruction-00006.tar":
+            return str(video_tar_path)
+        if filename == "captions/obstruction/captions-obstruction-00000.tar":
+            return str(right_caption_tar_path)
+        if filename == "captions/obstruction/captions-obstruction-00006.tar":
+            return str(wrong_caption_tar_path)
+        raise AssertionError(filename)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(HfApi=lambda: FakeHfApi(), hf_hub_download=fake_download),
+    )
+
+    output = tmp_path / "phyxsim.jsonl"
+    records = build_corpus_manifest(
+        BuildCorpusConfig(
+            output=output,
+            source="recipe",
+            recipe="physicalai-phyxsim-range",
+            max_records=1,
+            max_shards=1,
+            max_shard_gb=0,
+            split_ratios=(("sae_train", 1.0),),
+        )
+    )
+
+    assert len(records) == 1
+    assert records[0]["prompt"] == "Balls collide with obstacles on a table."
+    assert records[0]["metadata"]["prompt_source"] == "phyxsim_caption_sidecar"
+    assert records[0]["metadata"]["sidecar_member"] == "obstruction_14d45a68_1608/LowAngle.json"
+    assert "captions/obstruction/captions-obstruction-00000.tar" in downloaded
+
+
 def test_hf_tar_range_uri_encodes_member_name():
     uri = hf_tar_range_uri(repo_id="org/repo", shard="data/shard.tar", member_name="videos/clip 1.mp4", offset=512, size=7)
     assert uri == "hf-tar-range://dataset/org/repo/data/shard.tar?offset=512&size=7&name=videos%2Fclip+1.mp4"

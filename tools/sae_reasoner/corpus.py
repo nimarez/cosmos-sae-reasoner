@@ -1355,8 +1355,9 @@ def build_from_hf_tar_range(
         if shard_list_uri
         else list_hf_tar_shards(api, repo_id=repo_id, shard_globs=shard_globs, max_shard_bytes=max_shard_bytes)
     )
+    repo_files = set(api.list_repo_files(repo_id, repo_type="dataset")) if sidecar_shard_strategy == "phyxsim_caption_tar" else None
     if sidecar_shard_strategy == "phyxsim_caption_tar":
-        shards = filter_phyxsim_captioned_video_shards(api, repo_id=repo_id, shards=shards)
+        shards = filter_phyxsim_captioned_video_shards(repo_files or set(), shards=shards)
     rng = random.Random(seed)
     rng.shuffle(shards)
     shards = partition_shards_for_worker(shards, worker_index=worker_index, num_workers=num_workers)
@@ -1387,6 +1388,11 @@ def build_from_hf_tar_range(
                     media_members=members,
                     sidecar_suffix=sidecar_suffix,
                     sidecar_shard_strategy=sidecar_shard_strategy,
+                    sidecar_candidate_shards=(
+                        phyxsim_caption_shards_for_video_shard(repo_files or set(), resolved_shard)
+                        if sidecar_shard_strategy == "phyxsim_caption_tar"
+                        else None
+                    ),
                     local_dir=Path(download_dir),
                 )
                 for member in members:
@@ -1808,15 +1814,47 @@ def load_range_tar_sidecars(
     sidecar_suffix: str | None,
     sidecar_shard_strategy: str | None,
     local_dir: Path,
+    sidecar_candidate_shards: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not sidecar_suffix:
         return {}
     if sidecar_shard_strategy is None:
         return load_tar_json_sidecars(media_tar, media_members, sidecar_suffix=sidecar_suffix)
     if sidecar_shard_strategy == "phyxsim_caption_tar":
-        caption_shard = phyxsim_caption_shard_for_video_shard(shard)
-        if not caption_shard:
-            return {}
+        caption_shards = sidecar_candidate_shards
+        if caption_shards is None:
+            caption_shard = phyxsim_caption_shard_for_video_shard(shard)
+            caption_shards = [caption_shard] if caption_shard else []
+        return load_phyxsim_range_caption_sidecars(
+            hf_hub_download,
+            repo_id=repo_id,
+            caption_shards=caption_shards,
+            media_members=media_members,
+            sidecar_suffix=sidecar_suffix,
+            local_dir=local_dir,
+        )
+    raise ValueError(f"unsupported tar sidecar shard strategy: {sidecar_shard_strategy!r}")
+
+
+def load_phyxsim_range_caption_sidecars(
+    hf_hub_download: Any,
+    *,
+    repo_id: str,
+    caption_shards: list[str],
+    media_members: list[tarfile.TarInfo],
+    sidecar_suffix: str,
+    local_dir: Path,
+) -> dict[str, dict[str, Any]]:
+    needed = {
+        sidecar_member
+        for member in media_members
+        if (sidecar_member := sidecar_member_for_media_member(member.name, sidecar_suffix=sidecar_suffix))
+    }
+    found: dict[str, dict[str, Any]] = {}
+    for caption_shard in caption_shards:
+        missing = needed - set(found)
+        if not missing:
+            break
         try:
             _resolved_sidecar_shard, sidecar_path = download_hf_tar_shard(
                 hf_hub_download,
@@ -1825,10 +1863,23 @@ def load_range_tar_sidecars(
                 local_dir=local_dir,
             )
         except Exception:
-            return {}
+            continue
         with tarfile.open(sidecar_path, mode="r:*") as sidecar_tar:
-            return load_tar_json_sidecars(sidecar_tar, media_members, sidecar_suffix=sidecar_suffix)
-    raise ValueError(f"unsupported tar sidecar shard strategy: {sidecar_shard_strategy!r}")
+            found.update(load_tar_json_sidecars_by_name(sidecar_tar, missing))
+    return found
+
+
+def load_tar_json_sidecars_by_name(tar: tarfile.TarFile, needed: set[str]) -> dict[str, dict[str, Any]]:
+    sidecars: dict[str, dict[str, Any]] = {}
+    for member in tar.getmembers():
+        if member.name not in needed:
+            continue
+        extracted = tar.extractfile(member)
+        if extracted is None:
+            continue
+        with extracted:
+            sidecars[member.name] = json.loads(extracted.read().decode("utf-8"))
+    return sidecars
 
 
 def phyxsim_caption_shard_for_video_shard(shard: str) -> str | None:
@@ -1843,9 +1894,17 @@ def phyxsim_caption_shard_for_video_shard(shard: str) -> str | None:
     return str(PurePosixPath("captions") / category / f"captions-{category}-{suffix}")
 
 
-def filter_phyxsim_captioned_video_shards(api: Any, *, repo_id: str, shards: list[str]) -> list[str]:
-    files = set(api.list_repo_files(repo_id, repo_type="dataset"))
-    return [shard for shard in shards if (caption_shard := phyxsim_caption_shard_for_video_shard(shard)) and caption_shard in files]
+def phyxsim_caption_shards_for_video_shard(files: set[str], shard: str) -> list[str]:
+    parts = PurePosixPath(shard).parts
+    if len(parts) != 3 or parts[0] != "videos":
+        return []
+    category = parts[1]
+    prefix = str(PurePosixPath("captions") / category / f"captions-{category}-")
+    return sorted(path for path in files if path.startswith(prefix) and path.endswith(".tar"))
+
+
+def filter_phyxsim_captioned_video_shards(files: set[str], *, shards: list[str]) -> list[str]:
+    return [shard for shard in shards if phyxsim_caption_shards_for_video_shard(files, shard)]
 
 
 def attach_tar_sidecar(
