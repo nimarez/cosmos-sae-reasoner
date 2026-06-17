@@ -1,11 +1,13 @@
 # SAE Reasoner — Practical Guides
 
-Two end-to-end walkthroughs:
+Three end-to-end walkthroughs:
 
 1. [Running the linear-probe baselines](#guide-1--running-the-linear-probe-baselines) — measure whether a
    concept is linearly decodable, and whether SAE features beat a raw-activation probe.
 2. [Discovering and naming features](#guide-2--discovering-and-naming-features) — triage an SAE's latents,
    inspect what they fire on, name them, and validate the names.
+3. [Unsupervised concept discovery (PCA / ICA)](#guide-3--unsupervised-concept-discovery-pca--ica) — fit a
+   label-free linear basis, name its directions like SAE features, and use it as a baseline the SAE must beat.
 
 Both assume you have already collected activations and (for SAE steps) trained an SAE. See the
 [README](README.md) for `build-corpus-manifest` → `collect-activations` → `train-sae`. Throughout,
@@ -200,3 +202,95 @@ A feature is "named with confidence" only when:
 - [ ] Causal: steering toward the concept works, ablation degrades it (`steer`).
 - [ ] Not trivially redundant: a raw-activation probe does **not** match it (`compare-sae-probe`).
 - [ ] (For airtight claims) does not reproduce under a random-init control.
+
+---
+
+## Guide 3 — Unsupervised concept discovery (PCA / ICA)
+
+**Why.** The SAE is one way to factor the residual stream; PCA and ICA are cheaper, label-free
+linear baselines that complement it. **PCA** finds the orthogonal directions of maximum variance —
+a fast answer to "how much structure is just a handful of top directions?". **ICA** finds
+statistically-independent, non-Gaussian directions, historically closer to interpretable "features"
+than PCA's variance axes. The loop mirrors Guide 2 exactly — **fit → inspect → name** — and the same
+directions double as a baseline in the Guide 1 comparison.
+
+| Step | SAE (Guide 2) | PCA / ICA (here) |
+|------|---------------|------------------|
+| Fit the basis | `train-sae` | `decompose-activations` |
+| Find what each unit fires on | `find-features` | `find-components` |
+| Browse & name | `render-feature-report` | `render-feature-report` |
+
+### Step 1 — Fit a basis
+
+```bash
+python -m tools.sae_reasoner decompose-activations \
+  --activation-dir "$ACT" --method pca --n-components 64 \
+  --splits sae_train,sae_val --stream ar \
+  --output "$OUT/decomp/l18_pca.pt"
+```
+
+`--method ica` swaps in FastICA (fit on a random subsample capped by `--max-samples`; ICA is not
+streamable). PCA is exact and streams the `H×H` covariance, so it scales to millions of tokens.
+The same `--token-kinds` / `--phases` / `--splits` / `--stream` filters as the rest of the harness
+apply (a multi-stream load is rejected — pick one). This writes the basis `.pt` plus a
+`<output>.summary.json`.
+
+### Step 2 — Read the summary
+
+```jsonc
+{
+  "method": "pca",
+  "n_components": 64,
+  "explained_variance_ratio": [0.18, 0.09, ...],  // per kept component (PCA only; null for ICA)
+  "cumulative_variance_ratio": 0.81,              // fraction of variance the 64 dirs capture
+  "participation_ratio": 42.7                      // effective # of dimensions the stream uses
+}
+```
+
+A **low participation ratio** (relative to `hidden_dim`) means the stream lives in a small subspace
+— a finding on its own, before you inspect a single direction.
+
+### Step 3 — Inspect and name the directions
+
+```bash
+python -m tools.sae_reasoner find-components \
+  --activation-dir "$ACT" --basis "$OUT/decomp/l18_pca.pt" \
+  --component-ids 0,1,2 --top-n 20 \
+  --output "$OUT/decomp/l18_pca_top.jsonl"
+
+python -m tools.sae_reasoner render-feature-report \
+  --features "$OUT/decomp/l18_pca_top.jsonl" \
+  --output "$OUT/decomp/l18_pca.html" \
+  --title "Layer 18 PCA components"
+```
+
+Each row ranks the tokens whose activation projects most strongly onto the component (by
+`|projection|` under the default `--feature-rank absolute`; components are signed). The output is in
+the same schema as `find-features`, so the HTML browser and the Guide 2 naming workflow apply
+unchanged — pass a component-aware `--title`. Components are dense and orthogonal, not sparse, so
+expect them to be **less monosemantic** than good SAE latents; the top direction often tracks a
+coarse axis (e.g. modality) rather than a crisp concept.
+
+### Step 4 — Use it as a baseline the SAE must beat
+
+Turn the question around: does the SAE add anything over these cheap directions? Pass the basis to
+the Guide 1 comparison and it runs a third probe (PCA/ICA-direction) on the *same records and
+split* as the raw and SAE probes:
+
+```bash
+python -m tools.sae_reasoner compare-sae-probe \
+  --activation-dir "$ACT" --manifest "$MANIFEST" --sae "$SAE" \
+  --label-tag physics --aggregation mean --k-values 16,128 \
+  --decomp-basis "$OUT/decomp/l18_pca.pt" \
+  --output "$OUT/probes/physics_compare.json"
+```
+
+The summary gains a `decomp_probes` block and a top-level `decomp_beats_baseline`, parallel to
+`sae_beats_baseline`. A "useful SAE feature" claim is strongest when the SAE clears **both** the raw
+baseline and the unsupervised-direction baseline.
+
+### Sanity check
+
+As with the Guide 1 smoke test: top PCA components should separate the three modalities, so a
+PCA-direction probe on `--label-field media_type` should hit AUC ≈ 1.0. If it doesn't, the
+activation set or the join is suspect.

@@ -1467,10 +1467,12 @@ def cmd_compare_sae_probe(args: argparse.Namespace) -> int:
         decomp_X, _, _ = assemble_sae_feature_matrix(data, basis, label_map, sae_config, batch_size=args.batch_size)
         decomp_results = []
         for k in k_values:
-            result = fit_probe(decomp_X, y, sae_config, select_top_k=min(k, basis.config.feature_dim))
+            # select_top_k_features already clamps k to the component count, so pass the requested
+            # k unchanged — matching the SAE branch's labelling and avoiding duplicate fits.
+            result = fit_probe(decomp_X, y, sae_config, select_top_k=k)
             decomp_results.append(
                 {
-                    "k": min(k, basis.config.feature_dim),
+                    "k": k,
                     "auc_delta": result.test_auc - baseline_auc,
                     "decomp_wins": result.test_auc > baseline_auc,
                     "result": result.to_dict(),

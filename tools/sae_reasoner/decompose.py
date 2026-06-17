@@ -146,10 +146,11 @@ def fit_ica(acts: torch.Tensor, *, n_components: int, seed: int = 0, max_samples
     generator = torch.Generator().manual_seed(seed)
     if num_tokens > max_samples:
         idx = torch.randperm(num_tokens, generator=generator)[:max_samples]
-        sample = acts.index_select(0, idx).to(torch.float32)
+        sample = acts.index_select(0, idx)
     else:
-        sample = acts.to(torch.float32)
-    sample_np = sample.numpy().astype(np.float64)
+        sample = acts
+    # Single conversion to the dtype FastICA works in; .cpu() keeps it robust to GPU-resident inputs.
+    sample_np = sample.detach().cpu().to(torch.float64).numpy()
 
     ica = FastICA(n_components=n_components, random_state=seed, whiten="unit-variance", max_iter=1000)
     ica.fit(sample_np)

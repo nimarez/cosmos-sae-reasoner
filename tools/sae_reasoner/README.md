@@ -498,6 +498,36 @@ and a top-level `sae_beats_baseline`. SAE features are aggregated *after* encodi
 non-linear. The paper's headline finding is that the SAE rarely clears the baseline —
 treat `sae_beats_baseline: true` as the bar a "useful feature" claim must pass.
 
+## Unsupervised decompositions (PCA / ICA)
+
+PCA and ICA are label-free linear baselines that complement the SAE: a cheap basis you can both
+*name like SAE features* and use as an extra baseline the SAE must beat. The loop mirrors the SAE
+one — `decompose-activations` (fit, like `train-sae`) → `find-components` (rank top-projecting
+tokens, like `find-features`) → `render-feature-report` (the same HTML browser). See
+**[GUIDE.md, Guide 3](GUIDE.md#guide-3--unsupervised-concept-discovery-pca--ica)** for the full
+walkthrough.
+
+```bash
+# Fit a basis (PCA is exact + streams the HxH covariance; --method ica uses FastICA on a subsample).
+python -m tools.sae_reasoner decompose-activations \
+  --activation-dir "$ACTIVATION_URI" --method pca --n-components 64 \
+  --splits sae_train,sae_val --stream ar \
+  --output outputs/sae_reasoner/decomp/l18_pca.pt
+
+# Inspect the directions, then render them in the standard feature browser.
+python -m tools.sae_reasoner find-components \
+  --activation-dir "$ACTIVATION_URI" --basis outputs/sae_reasoner/decomp/l18_pca.pt \
+  --component-ids 0,1,2 --top-n 20 \
+  --output outputs/sae_reasoner/decomp/l18_pca_top.jsonl
+```
+
+`decompose-activations` writes the basis `.pt` plus a `<output>.summary.json` carrying
+`explained_variance_ratio`, cumulative variance, and the **participation ratio** (the effective
+number of dimensions the stream uses — a low value means it lives in a small subspace). The same
+filters as the rest of the harness apply, and a multi-stream load is rejected. Pass the basis to
+`compare-sae-probe --decomp-basis` to add a PCA/ICA-direction probe alongside the raw and SAE probes
+on the same split; the summary then carries `decomp_probes` and `decomp_beats_baseline`.
+
 For the BridgeData synthetic-caption prefill dataset, start with the compact
 batch-size/LR sweep at 8x expansion rather than 16x:
 
