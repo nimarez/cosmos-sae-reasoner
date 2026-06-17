@@ -9,6 +9,7 @@ huggingface_hub
 pillow
 pytest
 safetensors
+streamlit
 transformers>=4.57.0
 wandb
 

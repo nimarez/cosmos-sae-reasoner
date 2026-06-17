@@ -228,6 +228,33 @@ def build_parser() -> argparse.ArgumentParser:
     add_wandb_args(p)
     p.set_defaults(func=cmd_analyze_sae)
 
+    p = sub.add_parser("decompose-activations", help="fit an unsupervised linear basis (PCA/ICA) over activations")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--output", type=Path, required=True, help="Basis checkpoint path (.pt). Summary JSON is written beside it.")
+    p.add_argument("--method", choices=["pca", "ica"], default="pca")
+    p.add_argument("--n-components", type=int, default=64)
+    p.add_argument("--whiten", action="store_true", help="PCA only: scale each projection to unit variance.")
+    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--max-samples", type=int, default=50000, help="ICA only: cap the random subsample (ICA is not streamable).")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to include. Empty means all.")
+    p.add_argument("--phases", default="", help="Optional comma-separated token phases to include. Empty means all.")
+    p.add_argument("--splits", default="sae_train,sae_val", help="Comma-separated manifest splits to include. Empty means all.")
+    p.add_argument("--stream", default="", help="Restrict to one residual stream (e.g. 'ar'). A multi-stream load is rejected.")
+    add_wandb_args(p)
+    p.set_defaults(func=cmd_decompose_activations)
+
+    p = sub.add_parser("find-components", help="rank top-projecting records/tokens per decomposition component")
+    p.add_argument("--activation-dir", required=True, help="Local activation directory or S3 prefix.")
+    p.add_argument("--basis", type=Path, required=True, help="Decomposition basis from decompose-activations.")
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--top-n", type=int, default=20)
+    p.add_argument("--component-ids", type=str, default="", help="Comma-separated component ids. Empty means up to the first 128.")
+    p.add_argument("--feature-rank", choices=["absolute", "positive"], default="absolute", help="Components are signed; 'absolute' ranks by |projection|.")
+    p.add_argument("--token-kinds", default="", help="Optional comma-separated token kinds to include. Empty means all.")
+    p.add_argument("--phases", default="", help="Optional comma-separated token phases to include. Empty means all.")
+    p.set_defaults(func=cmd_find_components)
+
     p = sub.add_parser(
         "train-linear-probe",
         help="train a logistic-regression probe baseline on raw activations (arXiv:2502.16681)",
@@ -245,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k-values", default="16,128", help="Comma-separated top-k latent counts for the SAE probe (paper uses 16,128).")
     p.add_argument("--penalty", choices=["l2", "l1"], default="l2", help="Baseline (raw-activation) probe penalty.")
     p.add_argument("--sae-penalty", choices=["l1", "l2"], default="l1", help="SAE-feature probe penalty (paper uses L1).")
+    p.add_argument("--decomp-basis", type=Path, default=None, help="Optional PCA/ICA basis (decompose-activations); adds an unsupervised-direction probe baseline.")
     p.add_argument("--batch-size", type=int, default=4096, help="Encode batch size for SAE feature extraction.")
     p.add_argument("--device", default=None, help="Device for SAE encoding (default cpu).")
     p.set_defaults(func=cmd_compare_sae_probe)
@@ -1250,6 +1278,68 @@ def cmd_analyze_sae(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_decompose_activations(args: argparse.Namespace) -> int:
+    from .decompose import fit_ica, fit_pca, save_basis
+
+    data = load_activation_dataset(
+        args.activation_dir,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=parse_kind_filter(args.splits),
+        stream=args.stream or None,
+    )
+    if data.activations is None:
+        raise ValueError(f"no activation shards found in {args.activation_dir}")
+
+    if args.method == "pca":
+        basis, stats = fit_pca(data.activations, n_components=args.n_components, batch_size=args.batch_size, whiten=args.whiten)
+    else:
+        basis, stats = fit_ica(
+            data.activations, n_components=args.n_components, seed=args.seed, max_samples=args.max_samples, batch_size=args.batch_size
+        )
+
+    summary = {
+        "activation_dir": str(args.activation_dir),
+        "basis": str(args.output),
+        "filters": {"token_kinds": args.token_kinds, "phases": args.phases, "splits": args.splits, "stream": args.stream},
+        **stats,
+    }
+    wandb_run = init_basic_wandb_run(
+        args,
+        job_type="decompose_activations",
+        config={"activation_dir": str(args.activation_dir), "output": str(args.output), "method": args.method, "n_components": args.n_components},
+    )
+    if wandb_run is not None:
+        wandb_run.summary.update(flat_numeric_metrics({k: v for k, v in stats.items() if k != "explained_variance_ratio"}))
+        wandb_run.finish()
+    save_basis(str(args.output), basis, stats=stats, metadata=wandb_run_metadata(wandb_run))
+    summary_path = args.output.with_suffix(".summary.json")
+    ensure_dir(summary_path.parent)
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    print(json.dumps({"output": str(args.output), "summary_output": str(summary_path), **summary}, indent=2))
+    return 0
+
+
+def cmd_find_components(args: argparse.Namespace) -> int:
+    from .decompose import load_basis
+
+    basis = load_basis(str(args.basis))
+    component_ids = parse_feature_ids(args.component_ids, basis.config.feature_dim)
+    records = collect_top_feature_records(
+        activation_dir=args.activation_dir,
+        sae=basis,
+        feature_ids=component_ids,
+        top_n=args.top_n,
+        feature_rank=args.feature_rank,
+        token_kinds=parse_kind_filter(args.token_kinds),
+        phases=parse_kind_filter(args.phases),
+        splits=set(),
+    )
+    write_jsonl(args.output, records)
+    print(json.dumps({"output": str(args.output), "num_records": len(records)}, indent=2))
+    return 0
+
+
 def _probe_label_source(args: argparse.Namespace) -> str:
     if args.label_tag is not None:
         return f"tag:{args.label_tag}"
@@ -1368,6 +1458,37 @@ def cmd_compare_sae_probe(args: argparse.Namespace) -> int:
         "best_sae_k": best_sae["k"],
         "sae_beats_baseline": best_sae["result"]["test_auc"] > baseline_auc,
     }
+
+    # Optional unsupervised-direction baseline (PCA/ICA), on the same records + split.
+    if args.decomp_basis is not None:
+        from .decompose import load_basis
+
+        basis = load_basis(str(args.decomp_basis), map_location=args.device or "cpu")
+        decomp_X, _, _ = assemble_sae_feature_matrix(data, basis, label_map, sae_config, batch_size=args.batch_size)
+        decomp_results = []
+        for k in k_values:
+            result = fit_probe(decomp_X, y, sae_config, select_top_k=min(k, basis.config.feature_dim))
+            decomp_results.append(
+                {
+                    "k": min(k, basis.config.feature_dim),
+                    "auc_delta": result.test_auc - baseline_auc,
+                    "decomp_wins": result.test_auc > baseline_auc,
+                    "result": result.to_dict(),
+                }
+            )
+        best_decomp = max(decomp_results, key=lambda r: r["result"]["test_auc"])
+        summary.update(
+            {
+                "decomp_basis": str(args.decomp_basis),
+                "decomp_method": basis.config.method,
+                "decomp_n_components": int(basis.config.feature_dim),
+                "decomp_probes": decomp_results,
+                "best_decomp_auc": best_decomp["result"]["test_auc"],
+                "best_decomp_k": best_decomp["k"],
+                "decomp_beats_baseline": best_decomp["result"]["test_auc"] > baseline_auc,
+            }
+        )
+
     _write_summary(args.output, summary)
     return 0
 

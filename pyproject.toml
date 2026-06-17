@@ -18,6 +18,7 @@ sae = [
   "qwen-vl-utils",
   "safetensors",
   "scikit-learn>=1.8",
+  "streamlit",
   "torch",
   "torchvision",
   "transformers>=4.57.0",
